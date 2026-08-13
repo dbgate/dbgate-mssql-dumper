@@ -1,0 +1,83 @@
+{
+  "name": "dbgate-mssql-dumper",
+  "version": "0.1.0",
+  "description": "Standalone, client-agnostic Microsoft SQL Server SQL dump and restore library for Node.js",
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dbgate/dbgate-mssql-dumper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dbgate/dbgate-mssql-dumper/issues"
+  },
+  "homepage": "https://github.com/dbgate/dbgate-mssql-dumper#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./tedious": {
+      "types": "./dist/tedious.d.ts",
+      "import": "./dist/tedious.js",
+      "require": "./dist/tedious.cjs"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "clean": "tsup --clean",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint . --max-warnings 0",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "mssql",
+    "sql-server",
+    "sql",
+    "dump",
+    "backup",
+    "restore",
+    "database",
+    "tedious"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "tedious": ">=16.0.0"
+  },
+  "peerDependenciesMeta": {
+    "tedious": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.25.1",
+    "@types/node": "^22.15.3",
+    "eslint": "^9.25.1",
+    "prettier": "^3.5.3",
+    "tedious": "^20.0.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.31.0",
+    "vitest": "^3.1.2"
+  }
+}

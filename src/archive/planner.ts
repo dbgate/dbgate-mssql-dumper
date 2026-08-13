@@ -1,0 +1,728 @@
+import type { MssqlDatabase } from '../model/database.js';
+import type { MssqlDiagnostic } from '../model/diagnostics.js';
+import type { MssqlObjectDependency } from '../model/objectDependency.js';
+import { archiveObjectTypeToKind } from '../model/reference.js';
+import type { MssqlObjectKind } from '../model/reference.js';
+import {
+  isSchemaSelected,
+  isTableSelected,
+  normalizeDumpSelection,
+} from '../selection/normalize.js';
+import type { NormalizedDumpSelection } from '../selection/types.js';
+import { createDumpId } from '../utils/hash.js';
+import { createArchiveIdentity } from './identity.js';
+import { archiveObjectPriority, assignDumpSection, dumpSectionPriority } from './sectionRules.js';
+import type {
+  ArchiveCycle,
+  ArchiveDependency,
+  ArchiveEntry,
+  ArchiveObjectType,
+  ArchiveSelectionState,
+  BrokenPreferenceEdge,
+  DumpArchiveInspection,
+  DumpMode,
+} from './types.js';
+
+export interface InspectDumpArchiveOptions {
+  readonly mode?: DumpMode;
+  readonly selection?: NormalizedDumpSelection;
+  /**
+   * When `true`, a hard dependency that would otherwise pull in a
+   * table/schema outside the selection is rejected (an error diagnostic,
+   * `valid: false`) instead of being included automatically. Mirrors
+   * `dbgate-pg-dumper`'s strict selection mode.
+   */
+  readonly strictSelection?: boolean;
+  /**
+   * Discovered view/routine/trigger cross-references. Defaults to
+   * `database.objectDependencies`; pass this explicitly to supply
+   * dependencies for a hand-built `MssqlDatabase` (as tests do) without
+   * needing a real introspection run.
+   */
+  readonly dependencies?: readonly MssqlObjectDependency[];
+}
+
+interface MutableEntry {
+  dumpId: string;
+  identity: string;
+  objectType: ArchiveObjectType;
+  section: ArchiveEntry['section'];
+  schemaName: string;
+  name: string;
+  parentName?: string;
+  dependsOn: ArchiveDependency[];
+  selectionState: ArchiveSelectionState;
+}
+
+/**
+ * Converts a normalized {@link MssqlDatabase} into an ordered, dependency-
+ * validated set of {@link ArchiveEntry} objects. This is independent of SQL
+ * text, output streams, and archive-file formats: it only decides *what*
+ * exists and in *what order* it must be restored.
+ */
+export function inspectDumpArchive(
+  database: MssqlDatabase,
+  options: InspectDumpArchiveOptions = {},
+): DumpArchiveInspection {
+  const mode = options.mode ?? 'full';
+  const selection = options.selection ?? normalizeDumpSelection();
+  const diagnostics: MssqlDiagnostic[] = [];
+  const entries = new Map<string, MutableEntry>();
+  let hasStrictViolation = false;
+
+  function addEntry(
+    objectType: ArchiveObjectType,
+    schemaName: string,
+    name: string,
+    parentName?: string,
+    extraParts?: readonly string[],
+  ): string {
+    const identity = createArchiveIdentity({
+      objectType,
+      schemaName,
+      name,
+      parentName,
+      extraParts,
+    });
+    const dumpId = createDumpId(identity);
+    const existing = entries.get(dumpId);
+    if (existing) {
+      diagnostics.push({
+        severity: 'error',
+        code: 'duplicate-archive-identity',
+        message: `Duplicate archive identity for ${objectType} "${schemaName}"."${name}"`,
+        objectReference: {
+          kind: archiveObjectTypeToKind(objectType),
+          schemaName,
+          name,
+          parentName,
+        },
+      });
+      return dumpId;
+    }
+    entries.set(dumpId, {
+      dumpId,
+      identity,
+      objectType,
+      section: assignDumpSection(objectType),
+      schemaName,
+      name,
+      parentName,
+      dependsOn: [],
+      selectionState: 'selected',
+    });
+    return dumpId;
+  }
+
+  function addDependency(
+    fromDumpId: string,
+    toDumpId: string,
+    strength: ArchiveDependency['strength'],
+  ): void {
+    const entry = entries.get(fromDumpId);
+    if (!entry || fromDumpId === toDumpId) {
+      return;
+    }
+    const existingEdge = entry.dependsOn.find(dep => dep.targetDumpId === toDumpId);
+    if (existingEdge) {
+      // A hard requirement always wins over a mere preference discovered elsewhere for the same pair.
+      if (strength === 'hard' && existingEdge.strength === 'preference') {
+        entry.dependsOn = entry.dependsOn.filter(dep => dep.targetDumpId !== toDumpId);
+        entry.dependsOn.push({ targetDumpId: toDumpId, strength: 'hard' });
+      }
+      return;
+    }
+    entry.dependsOn.push({ targetDumpId: toDumpId, strength });
+  }
+
+  function pushDependencyInclusionDiagnostic(
+    kind: MssqlObjectKind,
+    schemaName: string,
+    name: string,
+    label: string,
+  ): void {
+    if (options.strictSelection) {
+      hasStrictViolation = true;
+      diagnostics.push({
+        severity: 'error',
+        code: 'strict-selection-violation',
+        message: `${label} "${schemaName}"."${name}" is outside the selection but a selected object depends on it; strictSelection rejects automatic inclusion instead of allowing it`,
+        objectReference: { kind, schemaName, name },
+      });
+      return;
+    }
+    diagnostics.push({
+      severity: 'info',
+      code: 'included-as-dependency',
+      message: `${label} "${schemaName}"."${name}" is outside the selection but included because a selected object depends on it`,
+      objectReference: { kind, schemaName, name },
+    });
+  }
+
+  const schemaDumpId = new Map<string, string>();
+  const tableDumpId = new Map<string, string>();
+  const selectedTableKeys = new Set<string>();
+  /**
+   * Every table/view/sequence/procedure/function/trigger dumpId, keyed by
+   * `schemaName.name` — SQL Server shares one object namespace per schema
+   * across all of these kinds, so one qualified name is always unambiguous.
+   * Used only to resolve `objectDependencies` edges below; unrelated to
+   * `tableDumpId`, which backs the separate FK/constraint dependency-pull
+   * logic further down.
+   */
+  const objectDumpIdByQualifiedName = new Map<string, string>();
+
+  for (const schema of database.schemas) {
+    if (!isSchemaSelected(schema.schemaName, selection)) {
+      continue;
+    }
+    schemaDumpId.set(schema.schemaName, addEntry('schema', schema.schemaName, schema.schemaName));
+  }
+
+  function ensureSchemaEntry(schemaName: string): string {
+    const existing = schemaDumpId.get(schemaName);
+    if (existing) {
+      return existing;
+    }
+    const dumpId = addEntry('schema', schemaName, schemaName);
+    schemaDumpId.set(schemaName, dumpId);
+    const entry = entries.get(dumpId);
+    if (entry) {
+      entry.selectionState = 'dependency';
+    }
+    pushDependencyInclusionDiagnostic('schema', schemaName, schemaName, 'Schema');
+    return dumpId;
+  }
+
+  for (const table of database.tables) {
+    if (!isTableSelected(table.schemaName, table.pureName, selection)) {
+      continue;
+    }
+    const key = `${table.schemaName}.${table.pureName}`;
+    selectedTableKeys.add(key);
+    const dumpId = addEntry('table', table.schemaName, table.pureName);
+    tableDumpId.set(key, dumpId);
+    objectDumpIdByQualifiedName.set(key, dumpId);
+    addDependency(dumpId, ensureSchemaEntry(table.schemaName), 'hard');
+  }
+
+  function ensureTableEntry(schemaName: string, pureName: string): string | undefined {
+    const key = `${schemaName}.${pureName}`;
+    const existing = tableDumpId.get(key);
+    if (existing) {
+      return existing;
+    }
+    const model = database.tables.find(t => t.schemaName === schemaName && t.pureName === pureName);
+    if (!model) {
+      return undefined;
+    }
+    const dumpId = addEntry('table', schemaName, pureName);
+    tableDumpId.set(key, dumpId);
+    objectDumpIdByQualifiedName.set(key, dumpId);
+    const entry = entries.get(dumpId);
+    if (entry) {
+      entry.selectionState = 'dependency';
+    }
+    addDependency(dumpId, ensureSchemaEntry(schemaName), 'hard');
+    pushDependencyInclusionDiagnostic('table', schemaName, pureName, 'Table');
+    return dumpId;
+  }
+
+  for (const view of database.views) {
+    if (!isSchemaSelected(view.schemaName, selection)) {
+      continue;
+    }
+    const dumpId = addEntry('view', view.schemaName, view.pureName);
+    objectDumpIdByQualifiedName.set(`${view.schemaName}.${view.pureName}`, dumpId);
+    addDependency(dumpId, ensureSchemaEntry(view.schemaName), 'hard');
+  }
+
+  for (const routine of database.routines) {
+    if (!isSchemaSelected(routine.schemaName, selection)) {
+      continue;
+    }
+    const objectType: ArchiveObjectType = routine.kind === 'procedure' ? 'procedure' : 'function';
+    const dumpId = addEntry(objectType, routine.schemaName, routine.pureName);
+    objectDumpIdByQualifiedName.set(`${routine.schemaName}.${routine.pureName}`, dumpId);
+    addDependency(dumpId, ensureSchemaEntry(routine.schemaName), 'hard');
+  }
+
+  const sequenceDumpId = new Map<string, string>();
+  for (const sequence of database.sequences) {
+    if (!isSchemaSelected(sequence.schemaName, selection)) {
+      continue;
+    }
+    const key = `${sequence.schemaName}.${sequence.pureName}`;
+    const dumpId = addEntry('sequence', sequence.schemaName, sequence.pureName);
+    sequenceDumpId.set(key, dumpId);
+    objectDumpIdByQualifiedName.set(key, dumpId);
+    addDependency(dumpId, ensureSchemaEntry(sequence.schemaName), 'hard');
+  }
+
+  for (const pk of database.primaryKeys) {
+    if (!selectedTableKeys.has(`${pk.schemaName}.${pk.pureName}`)) {
+      continue;
+    }
+    const dumpId = addEntry('primaryKey', pk.schemaName, pk.constraintName, pk.pureName);
+    const tableId = ensureTableEntry(pk.schemaName, pk.pureName);
+    if (tableId) {
+      addDependency(dumpId, tableId, 'hard');
+    }
+  }
+
+  for (const uq of database.uniqueConstraints) {
+    if (!selectedTableKeys.has(`${uq.schemaName}.${uq.pureName}`)) {
+      continue;
+    }
+    const dumpId = addEntry('uniqueConstraint', uq.schemaName, uq.constraintName, uq.pureName);
+    const tableId = ensureTableEntry(uq.schemaName, uq.pureName);
+    if (tableId) {
+      addDependency(dumpId, tableId, 'hard');
+    }
+  }
+
+  for (const check of database.checkConstraints) {
+    if (!selectedTableKeys.has(`${check.schemaName}.${check.pureName}`)) {
+      continue;
+    }
+    const dumpId = addEntry(
+      'checkConstraint',
+      check.schemaName,
+      check.constraintName,
+      check.pureName,
+    );
+    const tableId = ensureTableEntry(check.schemaName, check.pureName);
+    if (tableId) {
+      addDependency(dumpId, tableId, 'hard');
+    }
+  }
+
+  for (const def of database.defaultConstraints) {
+    if (!selectedTableKeys.has(`${def.schemaName}.${def.pureName}`)) {
+      continue;
+    }
+    const dumpId = addEntry('defaultConstraint', def.schemaName, def.constraintName, def.pureName);
+    const tableId = ensureTableEntry(def.schemaName, def.pureName);
+    if (tableId) {
+      addDependency(dumpId, tableId, 'hard');
+    }
+  }
+
+  for (const index of database.indexes) {
+    if (!selectedTableKeys.has(`${index.schemaName}.${index.pureName}`)) {
+      continue;
+    }
+    const dumpId = addEntry('index', index.schemaName, index.indexName, index.pureName);
+    const tableId = ensureTableEntry(index.schemaName, index.pureName);
+    if (tableId) {
+      addDependency(dumpId, tableId, 'hard');
+    }
+  }
+
+  // Foreign keys must never block table creation or data loading: each FK entry depends only on
+  // its own table and the referenced table (both pre-data), never on another FK, so bulk-loading
+  // table data ahead of every FK (guaranteed by the data(1) < post-data(2) section order below) is
+  // always safe regardless of how the individual FKs relate to each other.
+  for (const fk of database.foreignKeys) {
+    if (!selectedTableKeys.has(`${fk.schemaName}.${fk.pureName}`)) {
+      continue;
+    }
+    const dumpId = addEntry('foreignKey', fk.schemaName, fk.constraintName, fk.pureName);
+    const tableId = ensureTableEntry(fk.schemaName, fk.pureName);
+    if (tableId) {
+      addDependency(dumpId, tableId, 'hard');
+    }
+    const refTableId = ensureTableEntry(fk.refSchemaName, fk.refTableName);
+    if (refTableId) {
+      addDependency(dumpId, refTableId, 'hard');
+    } else {
+      diagnostics.push({
+        severity: 'warning',
+        code: 'unresolved-foreign-key-target',
+        message: `Foreign key "${fk.constraintName}" references "${fk.refSchemaName}"."${fk.refTableName}", which is not present in the introspected model`,
+        objectReference: {
+          kind: 'foreignKey',
+          schemaName: fk.schemaName,
+          name: fk.constraintName,
+          parentName: fk.pureName,
+        },
+      });
+    }
+  }
+
+  for (const trigger of database.triggers) {
+    const key = `${trigger.schemaName}.${trigger.parentName}`;
+    if (!selectedTableKeys.has(key) && !isSchemaSelected(trigger.schemaName, selection)) {
+      continue;
+    }
+    const dumpId = addEntry('trigger', trigger.schemaName, trigger.triggerName, trigger.parentName);
+    objectDumpIdByQualifiedName.set(`${trigger.schemaName}.${trigger.triggerName}`, dumpId);
+    const tableId = ensureTableEntry(trigger.schemaName, trigger.parentName);
+    if (tableId) {
+      addDependency(dumpId, tableId, 'hard');
+    } else {
+      addDependency(dumpId, ensureSchemaEntry(trigger.schemaName), 'hard');
+    }
+  }
+
+  // Real cross-references, where SQL Server's own catalog metadata could establish them. A
+  // schema-bound reference is enforced by SQL Server (the referenced object cannot be dropped or
+  // incompatibly altered while it exists), so it becomes a hard requirement; an ordinary reference
+  // is not enforced or guaranteed accurate, so it becomes only an ordering preference — safe to
+  // discard if honoring it would create a cycle. A reference to an object outside this archive
+  // (excluded by selection, or never introspected) cannot become an edge at all; it is reported
+  // instead of silently ignored or guessed at.
+  const objectDependencies = options.dependencies ?? database.objectDependencies ?? [];
+  for (const dependency of objectDependencies) {
+    const fromDumpId = objectDumpIdByQualifiedName.get(
+      `${dependency.fromSchemaName}.${dependency.fromName}`,
+    );
+    if (!fromDumpId) {
+      continue;
+    }
+    const toDumpId = objectDumpIdByQualifiedName.get(
+      `${dependency.toSchemaName}.${dependency.toName}`,
+    );
+    if (!toDumpId) {
+      diagnostics.push({
+        severity: 'info',
+        code: 'unresolved-programmable-dependency',
+        message: `"${dependency.fromSchemaName}"."${dependency.fromName}" references "${dependency.toSchemaName}"."${dependency.toName}", which is not part of this archive (excluded by selection, or not introspected)`,
+        objectReference: {
+          kind: dependency.fromKind,
+          schemaName: dependency.fromSchemaName,
+          name: dependency.fromName,
+        },
+      });
+      continue;
+    }
+    addDependency(fromDumpId, toDumpId, dependency.isSchemaBoundReference ? 'hard' : 'preference');
+  }
+
+  if (mode !== 'schema-only') {
+    for (const key of selectedTableKeys) {
+      const tableId = tableDumpId.get(key);
+      const table = database.tables.find(t => `${t.schemaName}.${t.pureName}` === key);
+      if (!tableId || !table) {
+        continue;
+      }
+      const dataDumpId = addEntry('tableData', table.schemaName, table.pureName, table.pureName);
+      addDependency(dataDumpId, tableId, 'hard');
+    }
+
+    for (const sequence of database.sequences) {
+      const key = `${sequence.schemaName}.${sequence.pureName}`;
+      const seqDumpId = sequenceDumpId.get(key);
+      if (!seqDumpId) {
+        continue;
+      }
+      const stateDumpId = addEntry(
+        'sequenceState',
+        sequence.schemaName,
+        sequence.pureName,
+        sequence.pureName,
+      );
+      addDependency(stateDumpId, seqDumpId, 'hard');
+    }
+  }
+
+  const allowedSections = new Set(
+    mode === 'data-only'
+      ? (['data'] as const)
+      : mode === 'schema-only'
+        ? (['pre-data', 'post-data'] as const)
+        : (['pre-data', 'data', 'post-data'] as const),
+  );
+
+  const included = new Map<string, MutableEntry>();
+  for (const entry of entries.values()) {
+    if (allowedSections.has(entry.section)) {
+      included.set(entry.dumpId, entry);
+    }
+  }
+
+  for (const entry of included.values()) {
+    entry.dependsOn = entry.dependsOn.filter(dep => included.has(dep.targetDumpId));
+  }
+
+  const compare = (a: MutableEntry, b: MutableEntry): number => {
+    const sectionDiff = dumpSectionPriority(a.section) - dumpSectionPriority(b.section);
+    if (sectionDiff !== 0) return sectionDiff;
+    const priorityDiff = archiveObjectPriority(a.objectType) - archiveObjectPriority(b.objectType);
+    if (priorityDiff !== 0) return priorityDiff;
+    if (a.schemaName !== b.schemaName) return a.schemaName < b.schemaName ? -1 : 1;
+    if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+    return a.dumpId < b.dumpId ? -1 : a.dumpId > b.dumpId ? 1 : 0;
+  };
+
+  const { sorted, hardCycles, droppedPreferenceEdges } = resolveCyclesAndSort(included, compare);
+
+  for (const broken of droppedPreferenceEdges) {
+    diagnostics.push({
+      severity: 'info',
+      code: 'preference-cycle-broken',
+      message: `Dropped a non-essential ordering preference from "${broken.fromDumpId}" to "${broken.toDumpId}" to resolve a dependency cycle`,
+    });
+  }
+
+  if (hardCycles.length > 0) {
+    for (const cycle of hardCycles) {
+      diagnostics.push({
+        severity: 'error',
+        code: 'archive-dependency-cycle',
+        message: `Hard dependency cycle detected among archive entries: ${cycle.memberDumpIds.join(', ')}`,
+      });
+    }
+    const fallback = [...included.values()].sort(compare);
+    const result: ArchiveEntry[] = fallback.map(entry => toArchiveEntry(entry));
+    return {
+      valid: false,
+      entries: result,
+      diagnostics,
+      cycles: hardCycles,
+      droppedPreferenceEdges,
+    };
+  }
+
+  const result: ArchiveEntry[] = sorted.map((entry, index) => toArchiveEntry(entry, index));
+
+  return {
+    valid: !hasStrictViolation,
+    entries: result,
+    diagnostics,
+    cycles: [],
+    droppedPreferenceEdges,
+  };
+}
+
+function toArchiveEntry(entry: MutableEntry, sequenceNumber?: number): ArchiveEntry {
+  return {
+    dumpId: entry.dumpId,
+    identity: entry.identity,
+    objectType: entry.objectType,
+    section: entry.section,
+    schemaName: entry.schemaName,
+    name: entry.name,
+    parentName: entry.parentName,
+    dependsOn: entry.dependsOn,
+    selectionState: entry.selectionState,
+    sequenceNumber,
+  };
+}
+
+interface Edge {
+  readonly to: string;
+  strength: ArchiveDependency['strength'];
+}
+
+/**
+ * Resolves dependency cycles before sorting, differentiating hard
+ * dependencies from ordering preferences:
+ *
+ * 1. Find every strongly connected component (Tarjan's algorithm) of size
+ *    greater than one, or a self-loop, in the current edge set.
+ * 2. For each such component, if any of its *internal* edges are
+ *    preference-strength, drop all of them — breaking a cycle by removing
+ *    an edge that carries no correctness requirement is always safe — and
+ *    recompute.
+ * 3. Repeat until either no non-trivial component remains (success) or an
+ *    iteration finds only hard-only components left (failure: report them
+ *    as unresolved cycles rather than silently dropping a hard edge, which
+ *    would misrepresent a real restore-ordering requirement).
+ *
+ * Only after this converges does Kahn's algorithm run, so it can assume an
+ * acyclic graph and never has to guess which edge "caused" a cycle itself.
+ */
+function resolveCyclesAndSort(
+  included: Map<string, MutableEntry>,
+  compare: (a: MutableEntry, b: MutableEntry) => number,
+): {
+  sorted: MutableEntry[];
+  hardCycles: ArchiveCycle[];
+  droppedPreferenceEdges: BrokenPreferenceEdge[];
+} {
+  const edgesByNode = new Map<string, Edge[]>();
+  for (const entry of included.values()) {
+    edgesByNode.set(
+      entry.dumpId,
+      entry.dependsOn.map(dep => ({ to: dep.targetDumpId, strength: dep.strength })),
+    );
+  }
+
+  const droppedPreferenceEdges: BrokenPreferenceEdge[] = [];
+  const hardCycles: ArchiveCycle[] = [];
+
+  while (true) {
+    const components = computeStronglyConnectedComponents(included, edgesByNode);
+    const nonTrivial = components.filter(
+      component => component.length > 1 || hasSelfEdge(component[0]!, edgesByNode),
+    );
+    if (nonTrivial.length === 0) {
+      break;
+    }
+
+    let removedAny = false;
+    for (const component of nonTrivial) {
+      const memberSet = new Set(component);
+      for (const nodeId of component) {
+        const edges = edgesByNode.get(nodeId) ?? [];
+        const remaining: Edge[] = [];
+        for (const edge of edges) {
+          if (edge.strength === 'preference' && memberSet.has(edge.to)) {
+            droppedPreferenceEdges.push({ fromDumpId: nodeId, toDumpId: edge.to });
+            removedAny = true;
+          } else {
+            remaining.push(edge);
+          }
+        }
+        edgesByNode.set(nodeId, remaining);
+      }
+    }
+
+    if (!removedAny) {
+      for (const component of nonTrivial) {
+        hardCycles.push({ memberDumpIds: [...component].sort() });
+      }
+      break;
+    }
+  }
+
+  if (hardCycles.length > 0) {
+    return { sorted: [], hardCycles, droppedPreferenceEdges };
+  }
+
+  for (const entry of included.values()) {
+    entry.dependsOn = (edgesByNode.get(entry.dumpId) ?? []).map(edge => ({
+      targetDumpId: edge.to,
+      strength: edge.strength,
+    }));
+  }
+
+  const { sorted, remaining } = kahnSort(included, compare);
+  if (remaining.length > 0) {
+    // Should be unreachable: the graph was already made acyclic above. Surfaced as a hard cycle
+    // rather than silently truncating the output, in case this invariant is ever violated.
+    hardCycles.push({ memberDumpIds: remaining.sort() });
+    return { sorted: [], hardCycles, droppedPreferenceEdges };
+  }
+
+  return { sorted, hardCycles: [], droppedPreferenceEdges };
+}
+
+function hasSelfEdge(nodeId: string, edgesByNode: Map<string, Edge[]>): boolean {
+  return (edgesByNode.get(nodeId) ?? []).some(edge => edge.to === nodeId);
+}
+
+/** Tarjan's strongly-connected-components algorithm over the current (possibly edge-reduced) graph. */
+function computeStronglyConnectedComponents(
+  included: Map<string, MutableEntry>,
+  edgesByNode: Map<string, Edge[]>,
+): string[][] {
+  let index = 0;
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const indices = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const components: string[][] = [];
+
+  function strongConnect(v: string): void {
+    indices.set(v, index);
+    lowlink.set(v, index);
+    index++;
+    stack.push(v);
+    onStack.add(v);
+
+    for (const edge of edgesByNode.get(v) ?? []) {
+      const w = edge.to;
+      if (!included.has(w)) {
+        continue;
+      }
+      if (!indices.has(w)) {
+        strongConnect(w);
+        lowlink.set(v, Math.min(lowlink.get(v)!, lowlink.get(w)!));
+      } else if (onStack.has(w)) {
+        lowlink.set(v, Math.min(lowlink.get(v)!, indices.get(w)!));
+      }
+    }
+
+    if (lowlink.get(v) === indices.get(v)) {
+      const component: string[] = [];
+      let w: string;
+      do {
+        w = stack.pop()!;
+        onStack.delete(w);
+        component.push(w);
+      } while (w !== v);
+      components.push(component);
+    }
+  }
+
+  for (const nodeId of included.keys()) {
+    if (!indices.has(nodeId)) {
+      strongConnect(nodeId);
+    }
+  }
+  return components;
+}
+
+/** Kahn's algorithm, assuming an already-acyclic graph. `remaining` is non-empty only if that assumption was violated. */
+function kahnSort(
+  included: Map<string, MutableEntry>,
+  compare: (a: MutableEntry, b: MutableEntry) => number,
+): { sorted: MutableEntry[]; remaining: string[] } {
+  const indegree = new Map<string, number>();
+  const dependents = new Map<string, string[]>();
+
+  for (const entry of included.values()) {
+    indegree.set(entry.dumpId, 0);
+    dependents.set(entry.dumpId, []);
+  }
+  for (const entry of included.values()) {
+    for (const dep of entry.dependsOn) {
+      indegree.set(entry.dumpId, (indegree.get(entry.dumpId) ?? 0) + 1);
+      dependents.get(dep.targetDumpId)?.push(entry.dumpId);
+    }
+  }
+
+  let ready = [...included.values()].filter(entry => (indegree.get(entry.dumpId) ?? 0) === 0);
+  ready.sort(compare);
+
+  const sorted: MutableEntry[] = [];
+  const remaining = new Set(included.keys());
+
+  while (ready.length > 0) {
+    const next = ready.shift();
+    if (!next) break;
+    remaining.delete(next.dumpId);
+    sorted.push(next);
+    const newlyReady: MutableEntry[] = [];
+    for (const dependentId of dependents.get(next.dumpId) ?? []) {
+      const remainingIndegree = (indegree.get(dependentId) ?? 0) - 1;
+      indegree.set(dependentId, remainingIndegree);
+      if (remainingIndegree === 0) {
+        const dependentEntry = included.get(dependentId);
+        if (dependentEntry) {
+          newlyReady.push(dependentEntry);
+        }
+      }
+    }
+    if (newlyReady.length > 0) {
+      newlyReady.sort(compare);
+      ready = mergeSorted(ready, newlyReady, compare);
+    }
+  }
+
+  return { sorted, remaining: [...remaining] };
+}
+
+function mergeSorted<T>(a: T[], b: T[], compare: (x: T, y: T) => number): T[] {
+  const merged: T[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    merged.push(compare(a[i]!, b[j]!) <= 0 ? a[i++]! : b[j++]!);
+  }
+  while (i < a.length) merged.push(a[i++]!);
+  while (j < b.length) merged.push(b[j++]!);
+  return merged;
+}
