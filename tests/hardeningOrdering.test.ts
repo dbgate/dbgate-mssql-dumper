@@ -9,7 +9,9 @@ import type { MssqlConnection, MssqlQuery, MssqlRow } from '../src/connection/ty
 import type { MssqlColumn } from '../src/model/column.js';
 import type { MssqlTable } from '../src/model/table.js';
 import { parseSqlBatches } from '../src/restore/batchParser.js';
+import { renderPlainSql } from '../src/renderer/plainSql.js';
 import { restoreSqlDump } from '../src/restore/restoreSqlDump.js';
+import { StringDumpWriter } from '../src/writer/stringWriter.js';
 import { buildEmptyDatabase } from './fixtures.js';
 
 function column(columnName: string): MssqlColumn {
@@ -416,5 +418,43 @@ describe('selection must not silently produce an empty dump', () => {
 
     const diagnostic = archive.diagnostics.find(d => d.code === 'dependency-excluded-by-selection');
     expect(diagnostic?.severity).toBe('warning');
+  });
+});
+
+describe('information must never be lost without a diagnostic', () => {
+  function schemaOnlyRender(ownerName: string | null, includeAuthorization: boolean) {
+    const database = buildEmptyDatabase({
+      schemas: [{ schemaName: 'owned', ownerName }],
+    });
+    const archive = inspectDumpArchive(database, { mode: 'schema-only' });
+    const writer = new StringDumpWriter();
+    return renderPlainSql({
+      database,
+      archive,
+      writer,
+      options: { includeSchemaAuthorization: includeAuthorization },
+    }).then(result => ({ sql: writer.toString(), result }));
+  }
+
+  it('warns rather than silently reassigning a non-dbo schema owner', async () => {
+    const { sql, result } = await schemaOnlyRender('appuser', false);
+    // Omitted by default so the dump stays restorable where the principal does
+    // not exist, but the loss is reported.
+    expect(sql).not.toContain('AUTHORIZATION');
+    expect(result.warnings.map(w => w.code)).toContain('schema-owner-not-preserved');
+  });
+
+  it('emits AUTHORIZATION when the caller opts in, and then does not warn', async () => {
+    const { sql, result } = await schemaOnlyRender('appuser', true);
+    expect(sql).toContain('CREATE SCHEMA owned AUTHORIZATION appuser');
+    expect(result.warnings.map(w => w.code)).not.toContain('schema-owner-not-preserved');
+  });
+
+  it('says nothing for a dbo-owned schema either way', async () => {
+    for (const opt of [false, true]) {
+      const { sql, result } = await schemaOnlyRender('dbo', opt);
+      expect(sql).not.toContain('AUTHORIZATION');
+      expect(result.warnings.map(w => w.code)).not.toContain('schema-owner-not-preserved');
+    }
   });
 });

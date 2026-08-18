@@ -23,6 +23,18 @@ export interface PlainSqlRenderOptions {
   readonly quoteAllIdentifiers?: boolean;
   /** Emits `DROP ... IF EXISTS` statements in reverse dependency order before creation. Minimum target: SQL Server 2016. */
   readonly includeDropStatements?: boolean;
+  /**
+   * Emit `AUTHORIZATION <owner>` on `CREATE SCHEMA` for a schema not owned by
+   * `dbo`. Defaults to `false`.
+   *
+   * Ownership is genuinely part of a schema's definition, but this package does
+   * not dump principals — so emitting it would make the dump unrestorable into
+   * any database that lacks that user or role, which is the usual case when
+   * cloning. Left off, ownership falls back to the restoring principal and a
+   * `schema-owner-not-preserved` warning is reported, so the loss is never
+   * silent. Turn it on when the target is known to have the same principals.
+   */
+  readonly includeSchemaAuthorization?: boolean;
   readonly includeTimestamp?: boolean;
   /** Emits `sp_addextendedproperty` calls for `MS_Description` comments. Defaults to true. */
   readonly includeComments?: boolean;
@@ -66,6 +78,7 @@ export interface ResolvedPlainSqlRenderOptions {
   readonly lineEnding: LineEnding;
   readonly quoteAllIdentifiers: boolean;
   readonly includeDropStatements: boolean;
+  readonly includeSchemaAuthorization: boolean;
   readonly includeTimestamp: boolean;
   readonly includeComments: boolean;
   readonly unsupportedFeaturePolicy: UnsupportedFeaturePolicy;
@@ -80,6 +93,7 @@ export function resolvePlainSqlRenderOptions(
     lineEnding: options?.lineEnding ?? '\n',
     quoteAllIdentifiers: options?.quoteAllIdentifiers ?? false,
     includeDropStatements: options?.includeDropStatements ?? false,
+    includeSchemaAuthorization: options?.includeSchemaAuthorization ?? false,
     includeTimestamp: options?.includeTimestamp ?? false,
     includeComments: options?.includeComments ?? true,
     unsupportedFeaturePolicy: options?.unsupportedFeaturePolicy ?? 'error',

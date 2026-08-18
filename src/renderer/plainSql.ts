@@ -95,6 +95,21 @@ export async function renderPlainSql(
         continue;
       }
 
+      if (entry.objectType === 'schema' && !options.includeSchemaAuthorization) {
+        const owner = lookups.schemas.get(`${entry.schemaName}.${entry.name}`)?.ownerName;
+        if (owner && owner !== 'dbo') {
+          // Not silent: ownership is part of the schema definition, but emitting
+          // AUTHORIZATION would make the dump unrestorable wherever that
+          // principal does not exist. See `includeSchemaAuthorization`.
+          warnings.push({
+            severity: 'warning',
+            code: 'schema-owner-not-preserved',
+            message: `Schema "${entry.name}" is owned by "${owner}"; the restored schema will belong to whichever principal runs the restore. Set render.includeSchemaAuthorization to emit AUTHORIZATION, but only if the target already has that principal — this package does not dump users or roles.`,
+            objectReference: { kind: 'schema', schemaName: entry.schemaName, name: entry.name },
+          });
+        }
+      }
+
       const createSql = renderEntryCreateOrHandle(
         entry,
         lookups,

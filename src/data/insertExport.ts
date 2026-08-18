@@ -67,7 +67,13 @@ export async function exportTableDataAsInserts(
 
   const orderByClause =
     request.orderByColumns && request.orderByColumns.length > 0
-      ? ` ORDER BY ${request.orderByColumns.map(name => quoteIdentifier(name)).join(', ')}`
+      ? // `always-quote`: these names are never read by a human, and the default
+        // `quote-when-needed` policy leaves *context-sensitive* keywords bare —
+        // a primary-key column named `OFFSET` would turn `ORDER BY OFFSET` into
+        // the start of an OFFSET/FETCH clause and fail the whole export.
+        ` ORDER BY ${request.orderByColumns
+          .map(name => quoteIdentifier(name, 'always-quote'))
+          .join(', ')}`
       : '';
 
   const warnings: MssqlDiagnostic[] = [];

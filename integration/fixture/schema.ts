@@ -170,6 +170,16 @@ export const SOURCE_SCHEMA_BATCHES: readonly string[] = [
   [V] int null
 );`,
 
+  // Non-Unicode columns holding characters outside the database default code
+  // page. Both halves matter: the literal must be N-prefixed, and the column
+  // must carry its own COLLATE — otherwise the data becomes '??????'.
+  `create table [dbo].[Collations] (
+  [Id] int not null constraint [PK_Collations] primary key clustered,
+  [CyrillicVarchar] varchar(50) collate Cyrillic_General_CI_AS null,
+  [GreekChar] char(20) collate Greek_CI_AS null,
+  [DefaultVarchar] varchar(50) null
+);`,
+
   // Thousands of rows, for streaming/backpressure and batching coverage.
   `create table [dbo].[BigTable] (
   [Id] int identity(1,1) not null constraint [PK_BigTable] primary key clustered,
@@ -219,6 +229,11 @@ export const SOURCE_SCHEMA_BATCHES: readonly string[] = [
   as bigint start with 1000 increment by 5
   minvalue 1 maxvalue 999999999 no cycle cache 20;`,
   `create sequence [dbo].[PlainSeq] as int start with 1 increment by 1;`,
+
+  // An INSTEAD OF trigger on a view: the trigger's parent is a view, not a
+  // table, so it exercises the planner's non-table parent path and must still be
+  // ordered after the view it targets.
+  `create view [dbo].[vBaseForTrigger] as select [Id], [ColInt] from [dbo].[AllTypes];`,
 
   // ---------------------------------------------------- programmable objects
   `create view [sales].[vCustomerOrders]
@@ -280,6 +295,14 @@ GO
 GO
 line';
   select [Col]]Bracket] from [weird schema].[Table With Spaces];
+end;`,
+
+  `create trigger [dbo].[trInsteadOfView]
+on [dbo].[vBaseForTrigger]
+instead of insert
+as
+begin
+  set nocount on;
 end;`,
 
   `create trigger [sales].[trOrdersAudit]

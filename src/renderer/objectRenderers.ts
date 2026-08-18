@@ -117,16 +117,27 @@ function renderModuleWithSessionSettings(flags: ModuleSessionFlags, definition: 
 export function renderSchemaCreate(
   schemaName: string,
   options: ResolvedPlainSqlRenderOptions,
+  ownerName?: string | null,
 ): string {
   const literal = quoteUnicodeStringLiteral(schemaName);
   const ident = qi(schemaName, options);
+  // Schema ownership is part of the schema's definition: recreating a schema
+  // owned by an application principal as `dbo`-owned silently changes who can
+  // do what inside it. `dbo` is the default, so it needs no clause; anything
+  // else is emitted, and the restore fails loudly if the target lacks that
+  // principal (which is the honest outcome — this package does not dump
+  // principals, see docs/known-limitations.md).
+  const authorization =
+    options.includeSchemaAuthorization && ownerName && ownerName !== 'dbo'
+      ? ` AUTHORIZATION ${qi(ownerName, options)}`
+      : '';
   // `CREATE SCHEMA` may not be the non-first statement of a conditional
   // block, so it has to run through `EXEC` of a string — which means the
   // bracket-quoted identifier ends up *nested inside a string literal* and
   // needs the literal layer of escaping too. Bracket quoting alone doubles
   // `]`, not `'`, so a schema named `O'Brien` would otherwise terminate the
   // EXEC argument early (and a hostile name could append statements to it).
-  const execArgument = quoteUnicodeStringLiteral(`CREATE SCHEMA ${ident}`);
+  const execArgument = quoteUnicodeStringLiteral(`CREATE SCHEMA ${ident}${authorization}`);
   return `IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = ${literal})\nBEGIN\n${options.indentation}EXEC(${execArgument});\nEND;`;
 }
 
@@ -149,9 +160,13 @@ export function renderSchemaDrop(
   return `DROP SCHEMA IF EXISTS ${qi(schemaName, options)};`;
 }
 
+/** Collation names are plain word identifiers; anything else is not emitted. */
+const SAFE_COLLATION_NAME = /^[A-Za-z0-9_]+$/;
+
 export function renderTableCreate(
   table: MssqlTable,
   options: ResolvedPlainSqlRenderOptions,
+  databaseCollation?: string | null,
 ): string {
   const columns = table.columns
     .slice()
@@ -167,6 +182,19 @@ export function renderTableCreate(
         parts.push(formatColumnDataType(column));
         if (column.isIdentity) {
           parts.push(` IDENTITY(${column.identitySeed ?? 1n},${column.identityIncrement ?? 1n})`);
+        }
+        // A character column whose collation differs from the database default
+        // must carry it explicitly. Without this the restored column adopts the
+        // *target* database's default collation, and any character outside that
+        // code page is replaced with `?` on insert — so a `varchar` column with
+        // a Cyrillic or UTF-8 collation loses its data even though the literal
+        // itself was written correctly as `N'...'`.
+        if (
+          column.collationName &&
+          column.collationName !== databaseCollation &&
+          SAFE_COLLATION_NAME.test(column.collationName)
+        ) {
+          parts.push(` COLLATE ${column.collationName}`);
         }
         parts.push(column.isNullable ? ' NULL' : ' NOT NULL');
         // No inline `DEFAULT` here on purpose. Every default constraint —

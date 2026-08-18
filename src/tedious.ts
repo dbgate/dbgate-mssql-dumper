@@ -129,6 +129,25 @@ function rowFromColumns<Row extends MssqlRow>(columns: unknown): Row {
   return row as Row;
 }
 
+/**
+ * Rejects a connection configured with `useUTC: false`.
+ *
+ * Tedious builds `date`/`datetime`/`datetime2`/`smalldatetime`/`time` values as
+ * *local* times when `useUTC` is off, while this package renders them through
+ * `toISOString()`. Every such value would then be silently shifted by the host's
+ * UTC offset — a `date` of `2022-03-12` dumps as `'2022-03-11'` at UTC+2 — with
+ * no error and a perfectly well-formed dump. The default is `true`; this guard
+ * exists because the failure is otherwise completely invisible.
+ */
+function assertUsesUtc(useUTC: unknown, source: string): void {
+  if (useUTC === false) {
+    throw new MssqlDumperError(
+      'unsupported-connection-option',
+      `${source} has options.useUTC = false. This adapter requires useUTC (the tedious default) because date/time values are rendered as UTC ISO-8601 literals; with local-time values every dumped date and time would be silently shifted by the host's UTC offset.`,
+    );
+  }
+}
+
 /** Adapts a connected `tedious.Connection` as one physical {@link MssqlConnection}. */
 export class TediousConnectionAdapter implements MssqlConnection {
   private readonly connection: Connection;
@@ -136,6 +155,11 @@ export class TediousConnectionAdapter implements MssqlConnection {
   private inFlight: string | null = null;
 
   constructor(connection: Connection) {
+    assertUsesUtc(
+      (connection as unknown as { config?: { options?: { useUTC?: unknown } } }).config?.options
+        ?.useUTC,
+      'The supplied tedious.Connection',
+    );
     this.connection = connection;
   }
 
@@ -405,6 +429,7 @@ export interface ConnectTediousResult {
  * `dbgate-mssql-dumper/tedious` adapter module.
  */
 export function connectTedious(config: ConnectionConfiguration): Promise<ConnectTediousResult> {
+  assertUsesUtc(config.options?.useUTC, 'connectTedious config');
   return new Promise((resolve, reject) => {
     const tediousConnection = new Connection(config);
     tediousConnection.connect(error => {

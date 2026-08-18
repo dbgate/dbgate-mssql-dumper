@@ -64,7 +64,7 @@ describeIntegration('round-trip: source -> dump -> empty target -> restore -> ve
     // 4 customers + 4 orders + 4 audit rows + 4 AllTypes + 2 LegacyLobs + 1
     // PrecisionLimits + 2 MutualA + 2 MutualB + 2 weird + 2 reserved +
     // 2 Unicode + BigTable.
-    expect(dumpResult.rowsExported).toBe(29 + BIG_TABLE_ROW_COUNT);
+    expect(dumpResult.rowsExported).toBe(31 + BIG_TABLE_ROW_COUNT);
   });
 
   // ------------------------------------------------------------ the restore
@@ -111,6 +111,7 @@ describeIntegration('round-trip: source -> dump -> empty target -> restore -> ve
   it('recreates every programmable object kind', () => {
     const { views, routines, triggers } = targetIntrospection.database;
     expect(views.map(v => `${v.schemaName}.${v.pureName}`).sort()).toEqual([
+      'dbo.vBaseForTrigger',
       'sales.vCustomerOrderSummary',
       'sales.vCustomerOrders',
     ]);
@@ -120,7 +121,11 @@ describeIntegration('round-trip: source -> dump -> empty target -> restore -> ve
     expect(routineKeys).toContain('inline-table-function:sales.tvfOrdersForCustomer');
     expect(routineKeys).toContain('procedure:sales.uspGetCustomer');
     expect(routineKeys).toContain('procedure:dbo.uspGoTrap');
-    expect(triggers.map(t => t.triggerName)).toEqual(['trOrdersAudit']);
+    // Includes an INSTEAD OF trigger whose parent is a *view*, not a table.
+    expect(triggers.map(t => t.triggerName).sort()).toEqual(['trInsteadOfView', 'trOrdersAudit']);
+    const insteadOf = triggers.find(t => t.triggerName === 'trInsteadOfView');
+    expect(insteadOf?.isInsteadOf).toBe(true);
+    expect(insteadOf?.parentName).toBe('vBaseForTrigger');
   });
 
   // ----------------------------------------------------- data verification

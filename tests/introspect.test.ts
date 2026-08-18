@@ -389,6 +389,10 @@ function createIntrospectionScenario() {
       if (query.sql.includes('from sys.default_constraints dc')) {
         return respond([]);
       }
+      // Indexes on views (indexed/materialized views) — reported as warnings.
+      if (query.sql.includes('from sys.indexes vi')) {
+        return respond([]);
+      }
       if (query.sql.includes('from sys.indexes i')) {
         const ids = new Set(boundIds(query));
         return respond(indexHeaderRows.filter(r => ids.has(r.objectId)));

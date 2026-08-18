@@ -16,10 +16,10 @@ test so it cannot regress unnoticed.
 - **`decimal`/`numeric` beyond ~15 significant digits lose precision.**
   `readNumeric()` divides by `10^scale` in floating point. This package adds no
   further loss. Warning: `possible-precision-loss`.
-- **`money`/`smallmoney` at the range extreme fail to restore.** The maximum
+- **`money` at the range extreme fails to restore.** The maximum
   `922337203685477.5807` rounds _up_ as a double to a value outside the type's
   range, so the `INSERT` overflows rather than storing an approximation. Warning:
-  `possible-precision-loss`.
+  `possible-precision-loss`. (`smallmoney` is exact and carries no warning.)
 
 ## Column data not exported
 
@@ -48,6 +48,30 @@ literal in a plain `.sql` file.
 - **Extended properties** other than `MS_Description` are not read, and none are
   emitted.
 
+## Indexed (materialized) views
+
+An index on a **view** is not exported. This package models indexes on tables
+only, so a unique clustered index that makes a view materialized is not
+reproduced and the restored view is an ordinary, non-materialized view — query
+plans and performance change even though results do not.
+
+This is reported, never silent: every such index produces an
+`indexed-view-index-not-exported` warning naming the view and the index.
+Recreate those indexes manually after restoring.
+
+## Schema ownership
+
+`CREATE SCHEMA` is emitted **without** `AUTHORIZATION` by default, so a schema
+owned by an application principal is recreated owned by whoever runs the restore.
+Ownership is genuinely part of the schema's definition, but this package does not
+dump users or roles — emitting `AUTHORIZATION appuser` would make the dump
+unrestorable in any database lacking that principal, which is the normal case
+when cloning.
+
+The loss is reported as a `schema-owner-not-preserved` warning. Set
+`render: { includeSchemaAuthorization: true }` to emit the clause when you know
+the target already has the same principals.
+
 ## Restore
 
 - **No `sqlcmd` scripting.** `:setvar`, `$(Variable)` substitution, `:r`
@@ -72,6 +96,22 @@ literal in a plain `.sql` file.
 - **Row order is primary-key order, and a table with no primary key has no
   guaranteed row order.** Dumps of PK-less tables are still correct but not
   byte-reproducible.
+- **`GO` accepts a trailing line comment, not a trailing block comment or
+  semicolon.** `GO -- note` is a separator; `GO;` and `GO /* note */` are
+  rejected with `InvalidGoRepeatCountError`. `sqlcmd` rejects both too, and
+  failing loudly is safer than guessing where the batch ends.
+- **A UTF-8 BOM is tolerated** at the start of a file or a batch (it is trimmed
+  with surrounding whitespace).
+
+## Driver configuration
+
+The Tedious adapter **requires `useUTC` to be enabled** (its default). With
+`useUTC: false`, tedious builds `date`/`datetime`/`datetime2`/`smalldatetime`/
+`time` values as local times while this package renders them as UTC ISO-8601
+literals, so every dumped date and time would be silently shifted by the host's
+UTC offset. Both `connectTedious` and `fromTediousConnection` reject such a
+connection with an `unsupported-connection-option` error rather than producing a
+well-formed but wrong dump.
 
 ## Connections
 

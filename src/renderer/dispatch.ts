@@ -46,9 +46,15 @@ export function renderEntryCreate(
 
   switch (entry.objectType) {
     case 'schema':
-      return renderSchemaCreate(entry.name, options);
+      // Ownership comes from the model, so a non-`dbo`-owned schema keeps its
+      // owner instead of silently becoming `dbo`-owned on restore.
+      return renderSchemaCreate(entry.name, options, lookups.schemas.get(ownKey)?.ownerName);
     case 'table':
-      return renderTableCreate(requireLookup(lookups.tables, ownKey, 'table'), options);
+      return renderTableCreate(
+        requireLookup(lookups.tables, ownKey, 'table'),
+        options,
+        lookups.databaseCollation,
+      );
     case 'view':
       return renderViewCreate(requireLookup(lookups.views, ownKey, 'view'), options);
     case 'procedure':

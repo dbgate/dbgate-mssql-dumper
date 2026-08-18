@@ -142,6 +142,8 @@ npm test                        # unit tests, no Docker or network needed
 npm run docker:up               # start SQL Server 2022 on port 14330
 npm run test:integration        # round-trip tests against it
 npm run docker:down
+
+npm run test:package            # builds, then smoke-tests dist/ as ESM and CJS
 ```
 
 Integration tests skip themselves with a clear message when no server is

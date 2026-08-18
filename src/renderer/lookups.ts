@@ -15,6 +15,11 @@ import type { MssqlTrigger } from '../model/trigger.js';
 import type { MssqlView } from '../model/view.js';
 
 export interface RenderLookups {
+  /**
+   * The database's default collation. A column's own collation only needs a
+   * `COLLATE` clause when it differs from this.
+   */
+  readonly databaseCollation: string | null;
   readonly schemas: ReadonlyMap<string, MssqlSchema>;
   readonly tables: ReadonlyMap<string, MssqlTable>;
   readonly views: ReadonlyMap<string, MssqlView>;
@@ -45,6 +50,7 @@ export const indexKey = (schemaName: string, tableName: string, indexName: strin
 
 export function buildRenderLookups(database: MssqlDatabase): RenderLookups {
   return {
+    databaseCollation: database.collationName,
     schemas: new Map(database.schemas.map(s => [key(s.schemaName, s.schemaName), s])),
     tables: new Map(database.tables.map(t => [key(t.schemaName, t.pureName), t])),
     views: new Map(database.views.map(v => [key(v.schemaName, v.pureName), v])),

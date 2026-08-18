@@ -63,16 +63,31 @@ Concretely: `decimal(38,10)` holding
 `1234567890123456789012345678.1234567890` restores with roughly the leading 17
 digits intact and the remainder zeroed.
 
-### `money` / `smallmoney`
+### `money`
 
 Same float64 path (an integer divided by 10000), and with a harsher failure mode
 at the extreme: `money`'s maximum `922337203685477.5807` rounds **up** to
 `922337203685477.6` as a double, which is outside the type's range — so the
 generated `INSERT` fails with an arithmetic overflow rather than storing an
-approximation. Every `money`/`smallmoney` column therefore gets a
-`possible-precision-loss` warning.
+approximation. Every `money` column therefore gets a `possible-precision-loss`
+warning. Values within ~15 significant digits round-trip exactly.
 
-Values within ~15 significant digits round-trip exactly.
+`smallmoney` is **exact** and carries no warning: its whole range
+(±214748.3647) is 10 significant digits, comfortably inside what a double
+represents exactly.
+
+## Collation
+
+Character values are always written as `N'…'`, including for `char`/`varchar`/
+`text`. An un-prefixed literal is typed in the **restoring database's default
+collation**, and characters outside that code page are replaced with `?` before
+the value ever reaches the column — verified against SQL Server, where
+`'Привет'` under `SQL_Latin1_General_CP1_CI_AS` stores as `??????`.
+
+A column whose collation differs from the database default also gets an explicit
+`COLLATE` clause in `CREATE TABLE`. Both halves are required: without the clause
+the restored column adopts the target's default collation and mangles the value
+even though the literal was written correctly.
 
 ## Excluded from data export
 

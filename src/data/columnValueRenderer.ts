@@ -16,8 +16,23 @@ import type { SqlLiteralValue } from '../security/literals.js';
 const INTEGER_TYPES = new Set(['tinyint', 'smallint', 'int', 'bigint']);
 const EXACT_DECIMAL_TYPES = new Set(['decimal', 'numeric', 'money', 'smallmoney']);
 const APPROXIMATE_NUMERIC_TYPES = new Set(['float', 'real']);
-const NON_UNICODE_CHARACTER_TYPES = new Set(['char', 'varchar', 'text']);
-const UNICODE_CHARACTER_TYPES = new Set(['nchar', 'nvarchar', 'ntext']);
+/**
+ * Every character type — Unicode or not — is rendered with the `N'...'` prefix.
+ *
+ * An un-prefixed literal is typed as `varchar` in the **restoring database's
+ * default collation**, and characters outside that code page are replaced with
+ * `?` at parse time, before the value is ever assigned to the target column.
+ * Verified against SQL Server: under `SQL_Latin1_General_CP1_CI_AS`,
+ * `'Привет 日本語'` stores as `?????? ???`, while `N'Привет 日本語'` survives —
+ * because an `nvarchar` literal is converted using the *assignment target's*
+ * collation instead. A `varchar` column with a Cyrillic/Greek/UTF-8 collation
+ * therefore loses its data through the un-prefixed form.
+ *
+ * `N'...'` is always accepted for a non-Unicode target (SQL Server converts it
+ * implicitly), so there is no downside: anything the source column could hold,
+ * the target column can still hold.
+ */
+const CHARACTER_TYPES = new Set(['char', 'varchar', 'text', 'nchar', 'nvarchar', 'ntext']);
 const BINARY_TYPES = new Set(['binary', 'varbinary', 'image']);
 
 /** Never explicitly insertable: SQL Server generates and maintains these values itself. */
@@ -104,7 +119,11 @@ export function columnExportDiagnostics(
     });
   }
 
-  if (type === 'money' || type === 'smallmoney') {
+  // `smallmoney` is deliberately excluded: its full range (±214748.3647) is 10
+  // significant digits, so the int32/10000 division Tedious performs is always
+  // exactly representable as a double and the value round-trips bit-exactly.
+  // Warning about it would be a guaranteed false positive.
+  if (type === 'money') {
     // `money` carries 19 digits of precision and `smallmoney` 10, both at a
     // fixed scale of 4, and Tedious reads them by dividing an integer by
     // 10000 in floating point — so a `money` value always risks rounding.
@@ -116,7 +135,7 @@ export function columnExportDiagnostics(
     diagnostics.push({
       severity: 'warning',
       code: 'possible-precision-loss',
-      message: `Column "${schemaName}"."${pureName}"."${column.columnName}" is ${type}; the Tedious value parser reads it as a JS number (an IEEE 754 double) by dividing by 10000, so values needing more than ~15 significant digits are rounded — and a value at the very edge of ${type}'s range may round outside it and fail to restore`,
+      message: `Column "${schemaName}"."${pureName}"."${column.columnName}" is money; the Tedious value parser reads it as a JS number (an IEEE 754 double) by dividing by 10000, so values needing more than ~15 significant digits are rounded — and a value at the very edge of money's range may round outside it and fail to restore`,
       objectReference,
     });
   }
@@ -184,17 +203,26 @@ export function renderColumnValue(value: MssqlColumnValue, column: MssqlColumn):
       // only valid form — expanding 1.7976931348623157e+308 into 309 plain
       // digits yields a literal SQL Server parses as `decimal` (maximum
       // precision 38) and rejects with an overflow error.
-      return APPROXIMATE_NUMERIC_TYPES.has(type)
-        ? formatApproximateNumber(value)
-        : formatFiniteNumber(value);
+      if (APPROXIMATE_NUMERIC_TYPES.has(type)) {
+        return formatApproximateNumber(value);
+      }
+      const expanded = formatFiniteNumber(value);
+      // Clamp to the column's declared scale. At scale >= 23 the driver's
+      // `value / 10^scale` division yields a double whose shortest round-trip
+      // form expands to more fractional digits than `decimal` permits at all
+      // (up to 53 at scale 37), producing a literal outside the exact-numeric
+      // grammar this expansion exists to satisfy. A dot in `expanded` implies a
+      // magnitude below 1e21, where `toFixed` is well defined.
+      const dot = expanded.indexOf('.');
+      const scale = column.scale;
+      if (dot >= 0 && scale !== null && scale >= 0 && expanded.length - dot - 1 > scale) {
+        return value.toFixed(Math.min(scale, 38));
+      }
+      return expanded;
     }
   }
 
-  if (NON_UNICODE_CHARACTER_TYPES.has(type) && typeof value === 'string') {
-    return quoteStringLiteral(value);
-  }
-
-  if (UNICODE_CHARACTER_TYPES.has(type) && typeof value === 'string') {
+  if (CHARACTER_TYPES.has(type) && typeof value === 'string') {
     return quoteUnicodeStringLiteral(value);
   }
 

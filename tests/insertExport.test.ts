@@ -512,6 +512,16 @@ describe('exportTableDataAsInserts: identifiers reaching live SQL are always quo
       orderByColumns: ['a] DESC, (select 1) --'],
     });
     expect(sql).toContain('ORDER BY [a]] DESC, (select 1) --]');
+    // A column named after a context-sensitive keyword stays unambiguous.
+    const offsetSql = (
+      await captureQueries({
+        schemaName: 'dbo',
+        pureName: 'T',
+        columns: [column({ columnName: 'OFFSET', dataType: 'int', ordinalPosition: 1 })],
+        orderByColumns: ['OFFSET'],
+      })
+    )[0];
+    expect(offsetSql).toContain('ORDER BY [OFFSET]');
     expect(sql).not.toContain('(select 1) --]\n');
   });
 });
@@ -591,7 +601,10 @@ describe('exportTableDataAsInserts: deterministic row order', () => {
       orderByColumns: ['A', 'Odd]Name'],
     });
 
-    expect(streamed[0]).toContain('ORDER BY A, [Odd]]Name]');
+    // Always bracketed: the default policy would leave a context-sensitive
+    // keyword such as `OFFSET` bare, turning `ORDER BY OFFSET` into the start
+    // of an OFFSET/FETCH clause.
+    expect(streamed[0]).toContain('ORDER BY [A], [Odd]]Name]');
   });
 
   it('emits no ORDER BY when no order columns are supplied', async () => {

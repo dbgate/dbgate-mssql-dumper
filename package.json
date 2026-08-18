@@ -16,10 +16,11 @@
     "node": ">=20"
   },
   "files": [
+    "LICENSE",
+    "README.md",
     "dist",
     "docs",
-    "README.md",
-    "LICENSE"
+    "scripts"
   ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -45,11 +46,12 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint . --max-warnings 0",
-    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build && node scripts/smoke.mjs",
     "test": "vitest run",
     "test:all": "npm run test && npm run test:integration",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:integration:docker": "npm run docker:up && npm run test:integration",
+    "test:package": "npm run build && node scripts/smoke.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },

@@ -20,6 +20,7 @@ import {
   renderForeignKeyCreate,
   renderIndexCreate,
   renderSchemaCreate,
+  renderTableCreate,
   renderTriggerCreate,
   renderViewCreate,
 } from '../src/renderer/objectRenderers.js';
@@ -348,6 +349,59 @@ describe('line endings: CRLF output must not become CR CR LF', () => {
 
     expect(text).not.toContain('\r\r\n');
     expect(text).toContain('CREATE VIEW [dbo].[V] AS\r\nSELECT 1 AS X');
+  });
+});
+
+describe('collation must survive so non-ASCII data is not transcoded away', () => {
+  const options = resolvePlainSqlRenderOptions(undefined);
+
+  function tableWithCollation(collationName: string | null) {
+    return {
+      schemaName: 'dbo',
+      pureName: 'T',
+      objectId: 1,
+      createDate: null,
+      modifyDate: null,
+      comment: null,
+      isMemoryOptimized: false,
+      durability: null,
+      isSystemVersioned: false,
+      historyTableSchemaName: null,
+      historyTablePureName: null,
+      columns: [
+        column({
+          columnName: 'V',
+          dataType: 'varchar',
+          characterMaxLength: 50,
+          collationName,
+        }),
+      ],
+    };
+  }
+
+  it('emits COLLATE when the column differs from the database default', () => {
+    // Without it the restored column adopts the target database's default
+    // collation and every character outside that code page becomes `?` — the
+    // N-prefixed literal alone is not enough.
+    const sql = renderTableCreate(
+      tableWithCollation('Cyrillic_General_CI_AS'),
+      options,
+      'SQL_Latin1_General_CP1_CI_AS',
+    );
+    expect(sql).toContain('COLLATE Cyrillic_General_CI_AS');
+  });
+
+  it('omits COLLATE when the column matches the database default', () => {
+    const sql = renderTableCreate(
+      tableWithCollation('SQL_Latin1_General_CP1_CI_AS'),
+      options,
+      'SQL_Latin1_General_CP1_CI_AS',
+    );
+    expect(sql).not.toContain('COLLATE');
+  });
+
+  it('omits COLLATE for a column with no collation at all', () => {
+    expect(renderTableCreate(tableWithCollation(null), options, 'X')).not.toContain('COLLATE');
   });
 });
 

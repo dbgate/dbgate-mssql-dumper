@@ -9,6 +9,7 @@ import { loadDatabaseIdentity } from './catalog/database.js';
 import { loadDefaultConstraints } from './catalog/defaultConstraints.js';
 import { loadForeignKeys } from './catalog/foreignKeys.js';
 import { loadIndexes } from './catalog/indexes.js';
+import { loadIndexedViewDiagnostics } from './catalog/indexedViews.js';
 import { loadKeyConstraints } from './catalog/keyConstraints.js';
 import { loadProgrammableDependencies } from './catalog/programmableDependencies.js';
 import type { ResolvableObject } from './catalog/programmableDependencies.js';
@@ -100,6 +101,8 @@ export async function introspectMssql(
 
       const allViews = await loadViews(connection, signal);
       diagnostics.push(...allViews.diagnostics);
+      // Indexes on views are not modelled; report them rather than dropping them.
+      diagnostics.push(...(await loadIndexedViewDiagnostics(connection, signal)));
       const selectedViews = allViews.views.filter(view =>
         isSchemaSelected(view.schemaName, selection),
       );

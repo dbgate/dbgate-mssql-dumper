@@ -8,6 +8,16 @@ export default tseslint.config(
     ignores: ['dist/**', 'coverage/**', 'node_modules/**'],
   },
   {
+    // Node scripts run outside the TypeScript program and use Node globals.
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        console: 'readonly',
+        process: 'readonly',
+      },
+    },
+  },
+  {
     files: ['**/*.ts'],
     rules: {
       '@typescript-eslint/no-unused-vars': [

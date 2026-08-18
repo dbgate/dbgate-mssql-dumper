@@ -128,6 +128,12 @@ values (1, N'reserved ''group'' value', 2), (3, null, null);`,
   `insert into [Ünïcødé].[Zákazník] ([Ïd], [Jméno], [北京])
 values (1, N'Žluťoučký kůň', N'北京欢迎你'), (2, null, null);`,
 
+  // N-prefixed on the way in too, or the source itself would store '??????'.
+  `insert into [dbo].[Collations] ([Id], [CyrillicVarchar], [GreekChar], [DefaultVarchar])
+values
+  (1, N'Привет мир', N'Καλημέρα', 'plain ascii'),
+  (2, null, null, null);`,
+
   // ------------------------------------------------------------- BigTable
   // Set-based so seeding thousands of rows stays fast. Payload carries a
   // quote, Unicode and an emoji on every one of the rows, so the streaming
@@ -145,6 +151,7 @@ from sys.all_objects a cross join sys.all_objects b;`,
 export const STRICTLY_COMPARED_TABLES: readonly { schemaName: string; pureName: string }[] = [
   { schemaName: 'dbo', pureName: 'AllTypes' },
   { schemaName: 'dbo', pureName: 'BigTable' },
+  { schemaName: 'dbo', pureName: 'Collations' },
   { schemaName: 'dbo', pureName: 'LegacyLobs' },
   { schemaName: 'dbo', pureName: 'MutualA' },
   { schemaName: 'dbo', pureName: 'MutualB' },

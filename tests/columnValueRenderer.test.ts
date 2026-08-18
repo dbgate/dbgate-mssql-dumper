@@ -151,9 +151,16 @@ describe('renderColumnValue', () => {
     expect(renderColumnValue(3.14159, col)).toBe('3.14159');
   });
 
-  it('renders char/varchar/text with plain (non-unicode) quoting', () => {
-    const col = column({ columnName: 'Code', dataType: 'varchar' });
-    expect(renderColumnValue('AB-123', col)).toBe("'AB-123'");
+  it("renders char/varchar/text with N'...' too, so non-ASCII survives the restore", () => {
+    // An un-prefixed literal is typed in the *restoring database's* default
+    // collation and characters outside that code page become `?` before the
+    // value ever reaches the column. Verified against SQL Server:
+    // 'Привет' under SQL_Latin1_General_CP1_CI_AS stores as '??????'.
+    for (const dataType of ['char', 'varchar', 'text']) {
+      const col = column({ columnName: 'Code', dataType });
+      expect(renderColumnValue('AB-123', col)).toBe("N'AB-123'");
+      expect(renderColumnValue('Привет 日本語 😀', col)).toBe("N'Привет 日本語 😀'");
+    }
   });
 
   it("renders nchar/nvarchar/ntext with Unicode N'...' quoting", () => {
@@ -161,13 +168,36 @@ describe('renderColumnValue', () => {
     expect(renderColumnValue('Zürich café 北京', col)).toBe("N'Zürich café 北京'");
   });
 
-  it('escapes an embedded single quote in both quoting styles', () => {
-    expect(renderColumnValue("O'Brien", column({ columnName: 'X', dataType: 'varchar' }))).toBe(
-      "'O''Brien'",
-    );
-    expect(renderColumnValue("O'Brien", column({ columnName: 'X', dataType: 'nvarchar' }))).toBe(
-      "N'O''Brien'",
-    );
+  it('escapes an embedded single quote for every character type', () => {
+    for (const dataType of ['char', 'varchar', 'text', 'nchar', 'nvarchar', 'ntext']) {
+      expect(renderColumnValue("O'Brien", column({ columnName: 'X', dataType }))).toBe(
+        "N'O''Brien'",
+      );
+    }
+  });
+
+  it('emits no precision warning for smallmoney, whose range fits a double exactly', () => {
+    // ±214748.3647 is 10 significant digits, so the int32/10000 division the
+    // driver performs is always exact — warning here was a false positive.
+    expect(
+      columnExportDiagnostics(column({ columnName: 'M', dataType: 'smallmoney' }), 'dbo', 'T'),
+    ).toEqual([]);
+    expect(
+      columnExportDiagnostics(column({ columnName: 'M', dataType: 'money' }), 'dbo', 'T').map(
+        d => d.code,
+      ),
+    ).toContain('possible-precision-loss');
+  });
+
+  it('never emits more fractional digits than the column scale permits', () => {
+    // At scale >= 23 the driver's value/10^scale division yields a double whose
+    // shortest round-trip form expands past decimal's 38-digit maximum (up to
+    // 53 digits at scale 37), which is outside the exact-numeric grammar.
+    const col = column({ columnName: 'D', dataType: 'decimal', precision: 38, scale: 37 });
+    const rendered = renderColumnValue(5 / 1e37, col);
+    const fractional = rendered.split('.')[1] ?? '';
+    expect(fractional.length).toBeLessThanOrEqual(37);
+    expect(rendered).not.toContain('e');
   });
 
   it('preserves embedded CR/LF in string values', () => {

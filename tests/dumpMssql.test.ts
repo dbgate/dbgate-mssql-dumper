@@ -116,6 +116,7 @@ function createEndToEndScenario() {
         query.sql.includes('from sys.check_constraints cc') ||
         query.sql.includes('from sys.default_constraints dc') ||
         query.sql.includes('from sys.indexes i') ||
+        query.sql.includes('from sys.indexes vi') ||
         query.sql.includes('from sys.sequences seq') ||
         query.sql.includes('from sys.views v') ||
         query.sql.includes('from sys.objects o') ||
