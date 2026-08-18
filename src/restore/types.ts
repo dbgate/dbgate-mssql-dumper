@@ -1,32 +1,44 @@
-import type { Readable } from 'node:stream';
 import type { MssqlConnectionInput } from '../connection/types.js';
 import type { RestoreProgressCallback } from '../utils/progress.js';
+import type { SqlBatchParserOptions } from './batchParser.js';
+import type { BatchSourceLocation } from './location.js';
+import type { SqlDumpSource } from './source.js';
 
-export interface RestoreOptions {
-  /** Stop at the first failing batch. Defaults to `true`. */
+export interface RestoreOptions extends SqlBatchParserOptions {
+  /** Stop at the first batch that fails execution. Defaults to `true`. */
   readonly stopOnError?: boolean;
 }
 
-export type SqlDumpSource = string | Readable | AsyncIterable<string | Buffer>;
-
 export interface SqlDumpRestoreRequest {
   readonly connection: MssqlConnectionInput;
-  readonly sql: SqlDumpSource;
+  readonly source: SqlDumpSource;
   readonly options?: RestoreOptions;
   readonly signal?: AbortSignal;
-  readonly onProgress?: RestoreProgressCallback;
+  readonly progress?: RestoreProgressCallback;
 }
 
-export interface RestoreStatementError {
+/** One batch that parsed successfully but failed when executed; see {@link RestoreExecutionError}. */
+export interface RestoreBatchError {
   readonly batchIndex: number;
-  /** Truncated preview of the failing batch; see {@link safeSqlPreview}. */
+  readonly location: BatchSourceLocation;
+  /** Truncated, secret-redacted preview of the failing batch; see {@link safeSqlPreview}. */
   readonly sqlPreview: string;
   readonly message: string;
 }
 
 export interface SqlDumpRestoreResult {
-  readonly statementsExecuted: number;
-  readonly statementsFailed: number;
-  readonly errors: readonly RestoreStatementError[];
+  readonly batchesExecuted: number;
+  readonly batchesFailed: number;
+  /**
+   * Sum of `rowsAffected` reported by the connection across every
+   * successfully executed batch (repeated `GO <n>` executions each count
+   * separately). In practice this reflects rows inserted by data batches,
+   * since ordinary DDL (`CREATE TABLE`, `ALTER TABLE ADD CONSTRAINT`, ...)
+   * reports 0 — but it is a straightforward sum, not a data-batch-specific
+   * heuristic, so a script containing its own `UPDATE`/`DELETE` statements
+   * would contribute those rows too.
+   */
+  readonly rowsRestored: number;
+  readonly errors: readonly RestoreBatchError[];
   readonly cancelled: boolean;
 }

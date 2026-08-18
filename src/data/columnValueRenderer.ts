@@ -2,6 +2,7 @@ import type { MssqlColumnValue } from '../connection/types.js';
 import type { MssqlColumn } from '../model/column.js';
 import type { MssqlDiagnostic } from '../model/diagnostics.js';
 import {
+  formatApproximateNumber,
   formatFiniteNumber,
   quoteBinaryLiteral,
   quoteDateTimeLiteral,
@@ -74,7 +75,9 @@ export function columnExportDiagnostics(
     parentName: pureName,
   };
 
-  if (classifyColumnForExport(column) === 'unsupported') {
+  const classification = classifyColumnForExport(column);
+
+  if (classification === 'unsupported') {
     diagnostics.push({
       severity: 'warning',
       code: 'unsupported-column-type',
@@ -83,11 +86,37 @@ export function columnExportDiagnostics(
     });
   }
 
+  if (classification !== 'insertable') {
+    // The remaining diagnostics describe how a value would be *carried
+    // through* an INSERT. A computed, generated or excluded column's data is
+    // never exported at all, so warning about its round-trip fidelity would
+    // be pure noise — a computed `decimal(22,5)` column cannot lose precision
+    // it is never asked to reproduce.
+    return diagnostics;
+  }
+
   if ((type === 'decimal' || type === 'numeric') && (column.precision ?? 0) > 15) {
     diagnostics.push({
       severity: 'warning',
       code: 'possible-precision-loss',
       message: `Column "${schemaName}"."${pureName}"."${column.columnName}" is ${type}(${column.precision},${column.scale ?? 0}); a driver that reads it back as a JS number (an IEEE 754 double, ~15-17 significant digits) cannot represent every value at this precision exactly`,
+      objectReference,
+    });
+  }
+
+  if (type === 'money' || type === 'smallmoney') {
+    // `money` carries 19 digits of precision and `smallmoney` 10, both at a
+    // fixed scale of 4, and Tedious reads them by dividing an integer by
+    // 10000 in floating point — so a `money` value always risks rounding.
+    // Worth its own notice because the failure mode is harsher than for
+    // `decimal`: `money`'s maximum, 922337203685477.5807, rounds *up* to
+    // 922337203685477.6 as a double, which is outside the type's range, so
+    // the generated INSERT fails with an overflow instead of storing an
+    // approximation.
+    diagnostics.push({
+      severity: 'warning',
+      code: 'possible-precision-loss',
+      message: `Column "${schemaName}"."${pureName}"."${column.columnName}" is ${type}; the Tedious value parser reads it as a JS number (an IEEE 754 double) by dividing by 10000, so values needing more than ~15 significant digits are rounded — and a value at the very edge of ${type}'s range may round outside it and fail to restore`,
       objectReference,
     });
   }
@@ -130,21 +159,35 @@ export function renderColumnValue(value: MssqlColumnValue, column: MssqlColumn):
     return value ? '1' : '0';
   }
 
-  if (INTEGER_TYPES.has(type)) {
-    if (typeof value === 'bigint') return value.toString();
-    if (typeof value === 'number') return formatFiniteNumber(value);
-  }
-
-  if (EXACT_DECIMAL_TYPES.has(type)) {
+  if (
+    INTEGER_TYPES.has(type) ||
+    EXACT_DECIMAL_TYPES.has(type) ||
+    APPROXIMATE_NUMERIC_TYPES.has(type)
+  ) {
+    // A driver-supplied numeric *string* is emitted verbatim and unquoted:
+    // it is the only representation that carries more precision than an IEEE
+    // 754 double without this package reintroducing loss of its own. This is
+    // not hypothetical — Tedious's value parser returns every `bigint`
+    // column as a decimal string (`readBigInt` calls `.toString()` on the
+    // 64-bit value precisely to avoid a lossy JS number), so without this
+    // branch a `bigint` would fall through to the generic literal renderer
+    // and be emitted as a quoted `N'...'` string. Validated against
+    // SAFE_NUMERIC_TEXT first so unexpected text can never break statement
+    // syntax; anything else is quoted defensively.
     if (typeof value === 'string') {
       return SAFE_NUMERIC_TEXT.test(value) ? value : quoteStringLiteral(value);
     }
     if (typeof value === 'bigint') return value.toString();
-    if (typeof value === 'number') return formatFiniteNumber(value);
-  }
-
-  if (APPROXIMATE_NUMERIC_TYPES.has(type)) {
-    if (typeof value === 'number') return formatFiniteNumber(value);
+    if (typeof value === 'number') {
+      // `float`/`real` are approximate numerics: T-SQL accepts exponential
+      // notation for them, and near the edges of the double range it is the
+      // only valid form — expanding 1.7976931348623157e+308 into 309 plain
+      // digits yields a literal SQL Server parses as `decimal` (maximum
+      // precision 38) and rejects with an overflow error.
+      return APPROXIMATE_NUMERIC_TYPES.has(type)
+        ? formatApproximateNumber(value)
+        : formatFiniteNumber(value);
+    }
   }
 
   if (NON_UNICODE_CHARACTER_TYPES.has(type) && typeof value === 'string') {

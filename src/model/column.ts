@@ -12,8 +12,13 @@ export interface MssqlColumn {
   readonly scale: number | null;
   readonly isNullable: boolean;
   readonly isIdentity: boolean;
-  readonly identitySeed: number | null;
-  readonly identityIncrement: number | null;
+  /**
+   * `bigint`, not `number`: an identity on a `bigint` column can legally seed
+   * beyond 2^53 (`IDENTITY(9007199254740993, 1)`), and narrowing it to a JS
+   * double would silently shift the restored table's key space by one.
+   */
+  readonly identitySeed: bigint | null;
+  readonly identityIncrement: bigint | null;
   readonly isComputed: boolean;
   readonly computedExpression: string | null;
   readonly isPersisted: boolean | null;

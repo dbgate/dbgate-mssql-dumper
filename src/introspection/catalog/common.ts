@@ -39,9 +39,3 @@ export function toBigIntOrNull(value: unknown): bigint | null {
   }
   throw new Error(`Cannot convert catalog value to bigint: ${String(value)}`);
 }
-
-/** Same conversion as {@link toBigIntOrNull}, narrowed to a safe JS `number` for fields too small to need full bigint precision. */
-export function toSafeNumberOrNull(value: unknown): number | null {
-  const big = toBigIntOrNull(value);
-  return big === null ? null : Number(big);
-}

@@ -8,7 +8,6 @@ interface ViewHeaderRow extends MssqlRow {
   readonly objectId: number;
   readonly schemaName: string;
   readonly pureName: string;
-  readonly isSchemaBound: boolean;
   readonly comment: string | null;
 }
 
@@ -31,7 +30,6 @@ export async function loadViews(
         v.object_id as objectId,
         s.name as schemaName,
         v.name as pureName,
-        v.is_schema_bound as isSchemaBound,
         cast(ep.value as nvarchar(max)) as comment
       from sys.views v
       inner join sys.schemas s on s.schema_id = v.schema_id
@@ -67,7 +65,9 @@ export async function loadViews(
       pureName: row.pureName,
       objectId: row.objectId,
       definition: module.definition,
-      isSchemaBound: row.isSchemaBound,
+      // `sys.views` has no schema-binding column of its own — the flag lives
+      // on `sys.sql_modules`, which `loadModules` already read above.
+      isSchemaBound: module.isSchemaBound ?? false,
       usesAnsiNulls: module.usesAnsiNulls,
       usesQuotedIdentifier: module.usesQuotedIdentifier,
       isEncrypted: module.isEncrypted,

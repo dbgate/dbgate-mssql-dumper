@@ -26,6 +26,10 @@ export interface RestoreProgressEvent {
   readonly message?: string;
   readonly statementsProcessed?: number;
   readonly statementsTotal?: number;
+  /** The batch currently being parsed/executed, 0-based in source order. */
+  readonly batchIndex?: number;
+  /** Running total of rows affected across every batch executed so far; see `SqlDumpRestoreResult.rowsRestored`. */
+  readonly rowsRestored?: number;
 }
 
 export type RestoreProgressCallback = (event: RestoreProgressEvent) => void;

@@ -21,6 +21,7 @@ import {
   renderViewCreate,
   renderViewDrop,
 } from './objectRenderers.js';
+import { indexKey } from './lookups.js';
 import type { RenderLookups } from './lookups.js';
 import type { ResolvedPlainSqlRenderOptions } from './types.js';
 
@@ -83,7 +84,15 @@ export function renderEntryCreate(
         options,
       );
     case 'index':
-      return renderIndexCreate(requireLookup(lookups.indexes, ownKey, 'index'), options);
+      // Keyed by parent table too: index names are only unique per table.
+      return renderIndexCreate(
+        requireLookup(
+          lookups.indexes,
+          indexKey(entry.schemaName, entry.parentName ?? '', entry.name),
+          'index',
+        ),
+        options,
+      );
     case 'tableData':
     case 'sequenceState':
       return null;
@@ -125,7 +134,14 @@ export function renderEntryDrop(
     case 'foreignKey':
       return renderConstraintDrop(entry.schemaName, entry.parentName ?? '', entry.name, options);
     case 'index':
-      return renderIndexDrop(requireLookup(lookups.indexes, ownKey, 'index'), options);
+      return renderIndexDrop(
+        requireLookup(
+          lookups.indexes,
+          indexKey(entry.schemaName, entry.parentName ?? '', entry.name),
+          'index',
+        ),
+        options,
+      );
     case 'tableData':
     case 'sequenceState':
       return null;

@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  buildObjectRefMap,
-  toBigIntOrNull,
-  toSafeNumberOrNull,
-} from '../src/introspection/catalog/common.js';
+import { buildObjectRefMap, toBigIntOrNull } from '../src/introspection/catalog/common.js';
 import { objectIdFilter } from '../src/introspection/catalog/objectIdFilter.js';
 
 describe('toBigIntOrNull', () => {
@@ -28,14 +24,6 @@ describe('toBigIntOrNull', () => {
   it('throws for a value it cannot interpret', () => {
     expect(() => toBigIntOrNull(true)).toThrow();
     expect(() => toBigIntOrNull({})).toThrow();
-  });
-});
-
-describe('toSafeNumberOrNull', () => {
-  it('narrows a bigint-shaped value to a JS number', () => {
-    expect(toSafeNumberOrNull('5')).toBe(5);
-    expect(toSafeNumberOrNull(5n)).toBe(5);
-    expect(toSafeNumberOrNull(null)).toBeNull();
   });
 });
 

@@ -44,6 +44,15 @@ export interface MssqlSession {
 
 const DEFAULT_ISOLATION_LEVEL: MssqlIsolationLevel = 'REPEATABLE READ';
 
+/** Closed allow-list guarding the one interpolated-into-SQL option this package has. */
+const ALLOWED_ISOLATION_LEVELS: ReadonlySet<MssqlIsolationLevel> = new Set([
+  'READ UNCOMMITTED',
+  'READ COMMITTED',
+  'REPEATABLE READ',
+  'SNAPSHOT',
+  'SERIALIZABLE',
+]);
+
 function noopSession(transactionMode: MssqlTransactionMode): MssqlSession {
   return {
     transactionMode,
@@ -100,6 +109,18 @@ export async function beginMssqlSession(
   }
 
   const isolationLevel = options.isolationLevel ?? DEFAULT_ISOLATION_LEVEL;
+  if (!ALLOWED_ISOLATION_LEVELS.has(isolationLevel)) {
+    // `SET TRANSACTION ISOLATION LEVEL` takes no bound parameter, so this is
+    // the one place in the package where a caller-supplied string reaches SQL
+    // text. The `MssqlIsolationLevel` union only constrains TypeScript
+    // callers; a plain-JS caller (or a value read from a config file or an
+    // HTTP body) can pass anything, so validate against a closed allow-list
+    // rather than trusting the compile-time type.
+    throw new MssqlDumperError(
+      'invalid-isolation-level',
+      `Unsupported transaction isolation level ${JSON.stringify(isolationLevel)}; expected one of: ${[...ALLOWED_ISOLATION_LEVELS].join(', ')}`,
+    );
+  }
   await connection.query({ sql: `SET TRANSACTION ISOLATION LEVEL ${isolationLevel};` }, signal);
   await connection.query({ sql: 'BEGIN TRANSACTION;' }, signal);
 
@@ -108,13 +129,23 @@ export async function beginMssqlSession(
     transactionMode,
     commit: async (commitSignal?: AbortSignal) => {
       if (finished) return;
-      finished = true;
+      // Marked finished only *after* the statement succeeds. Setting it first
+      // would make a failed COMMIT (a cancelled request, a broken connection)
+      // silently turn the caller's follow-up `rollback()` into a no-op, handing
+      // a pooled connection back with the transaction still open and its
+      // REPEATABLE READ locks still held.
       await connection.query({ sql: 'COMMIT TRANSACTION;' }, commitSignal);
+      finished = true;
     },
     rollback: async (rollbackSignal?: AbortSignal) => {
       if (finished) return;
-      finished = true;
-      await connection.query({ sql: 'ROLLBACK TRANSACTION;' }, rollbackSignal);
+      // Marked finished unconditionally: a failed rollback leaves nothing worth
+      // retrying, and retrying it would just raise the same error again.
+      try {
+        await connection.query({ sql: 'ROLLBACK TRANSACTION;' }, rollbackSignal);
+      } finally {
+        finished = true;
+      }
     },
   };
 }

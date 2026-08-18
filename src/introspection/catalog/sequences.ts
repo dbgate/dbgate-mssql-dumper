@@ -13,6 +13,7 @@ interface SequenceRow extends MssqlRow {
   readonly maxValue: MssqlColumnValue;
   readonly isCycling: boolean;
   readonly currentValue: MssqlColumnValue;
+  readonly isCached: boolean;
   readonly cacheSize: number | null;
   readonly comment: string | null;
 }
@@ -39,6 +40,7 @@ export async function loadSequences(
         cast(seq.maximum_value as bigint) as maxValue,
         seq.is_cycling as isCycling,
         cast(seq.current_value as bigint) as currentValue,
+        seq.is_cached as isCached,
         seq.cache_size as cacheSize,
         cast(ep.value as nvarchar(max)) as comment
       from sys.sequences seq
@@ -61,6 +63,7 @@ export async function loadSequences(
     maxValue: toBigIntOrNull(row.maxValue),
     isCycling: row.isCycling,
     currentValue: toBigIntOrNull(row.currentValue),
+    isCached: row.isCached,
     cacheSize: row.cacheSize,
     comment: row.comment,
   }));

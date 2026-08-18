@@ -68,6 +68,13 @@ not on a particular driver:
   session-level transaction-status API comparable to PostgreSQL's, so
   adapters that can approximate it (e.g. via `@@TRANCOUNT`/`XACT_STATE()`)
   implement it and callers must treat it as best-effort.
+- `execBatch?(sql, signal?)` — optional; executes `sql` as one genuine T-SQL
+  batch (no parameter binding), distinct from `query()`. On the Tedious
+  adapter this is the difference between `execSqlBatch` (what `execBatch`
+  calls) and `execSql` (what `query()` calls, routed through
+  `sp_executesql`) — see "Execution" under "Restore" below for why
+  `restoreSqlDump` specifically needs the former. Adapters that cannot
+  distinguish the two may omit it; callers fall back to `query()`.
 
 `MssqlConnectionSource` represents anything that must be _acquired_ to get one
 physical connection (a pool). `acquireMssqlConnection()` normalizes a direct
@@ -791,19 +798,168 @@ itself would need to originate.
 
 ## Restore
 
-`restoreSqlDump()` (`src/restore/`) is a plain-text batch executor, not a
-parser: `splitSqlIntoBatches` splits on lines that are `GO` alone (optionally
-followed by a repeat count, `GO 5`, matching `sqlcmd`/SSMS convention) and
-executes each resulting batch sequentially against one connection, honoring
-`stopOnError` (default `true`) and `AbortSignal`. `isDumperSqlDump` is a
-one-line heuristic (checks for this package's own dump header comment) for
-callers that want to sanity-check input before attempting a restore.
+`restoreSqlDump({ connection, source, options?, signal?, progress? })`
+(`src/restore/`) restores a plain-SQL dump using only the `MssqlConnection`
+abstraction — no `sqlcmd`, SMO, `bcp`, or external process is ever invoked.
+It is a real lexer over `GO`-separated batches followed by sequential
+execution, not a naive line-splitter: `GO` is only ever recognized as a
+batch separator when it is genuinely standalone, outside every string,
+bracketed/double-quoted identifier, and comment. `PRINT 'GO'` and a `GO`
+inside a comment never split a batch, and neither does a `GO` inside a
+multi-line string/bracket/comment — a case the previous, line-only
+implementation could get wrong.
 
-Because it is line-based rather than a full T-SQL tokenizer, a `GO` inside a
-multi-line string literal that happens to occupy its own source line would
-still be (mis)treated as a batch boundary. Output from `renderPlainSql`
-never does this, so dumps produced by this package round-trip safely; hand-
-edited or foreign SQL scripts with that shape would not.
+### The batch parser (`src/restore/batchParser.ts`)
+
+`SqlBatchParser` is an incremental state machine: feed it text via `push()`
+(any number of times, in any chunk size) and call `finish()` once at end of
+input. It tracks one lexer mode — `normal`, inside a `'...'` string, inside
+a `"..."` string/identifier, inside a `[...]` bracketed identifier, or
+inside a (possibly nested — SQL Server, unlike ANSI SQL, allows `/* /* */
+*/`) block comment — across line and chunk boundaries, correctly handling
+doubled-quote (`''`, `]]`) escapes. Line comments (`--`) never need a
+persisted mode since they always end at that physical line's own end. A
+`GO` line is recognized only when the lexer is in `normal` mode _at the
+start of that line_ and the line matches `^\s*GO(?:\s+(\d+))?\s*(?:--.*)?$`
+(case-insensitive) — the same convention `sqlcmd`/SSMS use, including the
+optional `GO <n>` repeat-count form.
+
+`parseSqlBatches(sql, options?)` is a convenience wrapper over one
+in-memory string; `streamSqlBatches(source, options?, signal?)` is the
+streaming form `restoreSqlDump` actually uses, accepting a `string`, a
+`Readable`, or any `AsyncIterable<string | Buffer | Uint8Array>` (`Buffer`/
+`Uint8Array` chunks are decoded as UTF-8 through a persistent
+`node:string_decoder` `StringDecoder`, so a multi-byte character split
+across two chunks is never corrupted). At most one in-progress batch's
+accumulated text, plus one pending partial line, is held in memory at a
+time — the whole input is never buffered. A single batch must still be sent
+to the server whole, so `options.maxBatchBytes` (default 64 MiB) bounds how
+much of a pathological input with no `GO` lines at all the parser will
+accumulate before giving up (`BatchTooLargeError`) rather than growing
+unboundedly.
+
+### Typed errors (`src/restore/errors.ts`)
+
+Every error `restoreSqlDump`/the parser throws intentionally extends
+`RestoreError`:
+
+- **`SqlBatchParseError`** (parser errors) and its subclasses —
+  **`MalformedSqlDumpError`** (a string/bracket/comment left open at end of
+  input), **`InvalidGoRepeatCountError`** (`GO 0`, `GO abc`, or a count
+  above `options.maxGoRepeatCount`, default 100,000), **`BatchTooLargeError`**,
+  and **`UnsupportedSqlcmdDirectiveError`** — are always fatal and thrown
+  out of `restoreSqlDump`: a parse failure means the batch boundaries
+  themselves are not trustworthy, so nothing after the failure point can be
+  safely executed either, regardless of `options.stopOnError`.
+- **`RestoreExecutionError`** is scoped to one batch that parsed correctly
+  but failed on the server. Unlike the parser errors, this is _not_ thrown
+  from `restoreSqlDump` — its data (`batchIndex`, `location`, a redacted
+  `sqlPreview`, and a redacted `message`) is what populates
+  `SqlDumpRestoreResult.errors`, and — unless `options.stopOnError` (the
+  default) — restoration continues with the next batch. This mirrors every
+  other stage in this package (`dumpMssql`, `exportTableDataAsInserts`,
+  `renderPlainSql`): a recoverable, per-item problem is returned as
+  structured data, not thrown.
+- Cancellation reuses the existing `OperationCancelledError` (`src/utils/errors.ts`):
+  an aborted `AbortSignal` makes `restoreSqlDump` return
+  `{ cancelled: true, ... }` with whatever partial counts had already
+  accumulated, the same convention every long-running function in this
+  package follows, rather than surfacing a thrown exception to distinguish
+  from a crash.
+
+### `sqlcmd` directives: detected and rejected, not implemented
+
+`sqlcmd`/SSMS preprocess a script — expanding `:setvar`/`$(Variable)`
+substitutions, running `:r` file includes, executing `:!!` shell escapes —
+_before_ any batch ever reaches SQL Server. `restoreSqlDump` executes
+batches directly against the connection and implements no such
+preprocessor. Rather than silently forwarding an unresolved
+`$(Variable)` token or a `:setvar` line to the server (which would fail
+with a confusing native syntax error, or in principle execute as
+unintended T-SQL), the parser detects these constructs explicitly and
+throws `UnsupportedSqlcmdDirectiveError`:
+
+- A colon-prefixed directive (`:r`, `:setvar`, `:connect`, `:on error`,
+  `:!!`, ...) is recognized only when the colon starts in column 1 (no
+  leading whitespace) — matching `sqlcmd` itself, and avoiding a false
+  positive on indented T-SQL that happens to contain a colon (a `CASE`
+  label, a `::` static method reference like `geography::STGeomFromText`).
+- A `$(Variable)` token is recognized outside any string/comment/bracket —
+  `$` is never a valid leading character of an unquoted T-SQL identifier,
+  so this is unambiguous in practice, and a `$(...)`-shaped substring
+  _inside_ a string literal (where it is just ordinary data) is correctly
+  left alone.
+
+### Supported subset
+
+`restoreSqlDump` targets **plain T-SQL batches, `GO`-separated**: the exact
+shape `renderPlainSql` produces, so a package-generated dump round-trips
+correctly by construction (verified by the end-to-end test in
+`dumpMssql.test.ts`/`restore.test.ts`). Ordinary hand-written SQL Server
+scripts restore too, as long as they do not rely on `sqlcmd` scripting
+(directives/variable substitution, detected and rejected above) or depend
+on a `GO`-alone-on-its-line appearing legitimately inside an unterminated
+multi-line string that was never meant to close before end of input (a
+lexically pathological case this package has no way to distinguish from a
+genuine mistake). This is a documented subset, not a claim of full
+`sqlcmd` compatibility.
+
+### Execution
+
+Each batch is executed via `connection.execBatch()` when the adapter
+provides it, falling back to `connection.query()` otherwise.
+`execBatch` is deliberately distinct from `query()`: on the Tedious
+adapter, `execBatch` calls `connection.execSqlBatch()` (a real TDS SQL
+batch, matching `sqlcmd`/SSMS exactly), while `query()` calls
+`connection.execSql()` (routed through `sp_executesql`). This matters for
+restore specifically — `CREATE PROCEDURE`/`CREATE VIEW`/`CREATE FUNCTION`/
+`CREATE TRIGGER` must be the only statement in their batch and can behave
+differently (or be rejected) inside an `sp_executesql` wrapper, and
+batch-scoped constructs (local temp tables, `SET` options meant to persist
+for later batches on the same connection) rely on not being sandboxed
+inside a nested execution context. `execBatch` also supports no parameter
+binding, matching `execSqlBatch`'s own contract — batches from a restored
+script are never parameterized. A `GO <n>` batch is executed `n` times in
+sequence, each execution counted and tallied independently.
+
+`SqlDumpRestoreResult.rowsRestored` sums `rowsAffected` across every
+successfully executed batch. Tedious's own `Request.rowCount` already
+accumulates across every `DONE`/`DONE_IN_PROC` token a batch produces (
+confirmed by reading `tedious/lib/token/handler.js`), so a data batch
+containing several `INSERT` statements — exactly what `dumpMssql`'s own
+data batches look like — reports their combined row count without this
+package needing to parse or count statements itself. This is a
+straightforward sum, not a data-batch-specific heuristic: ordinary DDL
+reports 0, so in practice the total reflects rows inserted, but a script
+containing its own `UPDATE`/`DELETE` statements would contribute those rows
+too.
+
+### Safety: previews and redaction
+
+`RestoreBatchError.sqlPreview` (via `safeSqlPreview`) is always truncated
+(200 characters by default) and never a full, potentially large statement.
+Both `sqlPreview` and the execution error's `message` are passed through
+`redactSecrets()` before being recorded, which blanks the value side of
+`PASSWORD =`/`PWD =`/`IDENTIFIED BY` clauses (`'...'` or `N'...'`) — a
+failing `CREATE LOGIN`/`ALTER LOGIN`/`CREATE USER` statement, or a driver
+error message that happens to echo the failing statement text back, can
+therefore never leak the literal credential value into a diagnostic or
+error. This is pattern-based, not a full parser, and protects the specific
+clauses SQL Server itself uses for credentials — not arbitrary
+"looks sensitive" text (see `src/security/sensitive.ts` for the equivalent
+guard over connection _options_, as opposed to SQL _text_).
+
+### Progress and cancellation
+
+`progress` receives `parsing` events (one per batch as it is parsed, with
+`batchIndex`) interleaved with `executing` events (one per batch execution,
+including each repetition of a `GO <n>` batch, with a running
+`rowsRestored` total) and a final `finalizing` event. `AbortSignal` is
+checked before every batch execution and at every chunk boundary while
+reading `source`; on cancellation, `restoreSqlDump` returns
+`{ cancelled: true, ... }` with whatever had already executed, and the
+acquired connection is always released via a `finally` block, regardless of
+how the function returns.
 
 `preflightRestore()` (`src/preflight/`) currently only detects the restore
 target's version/capabilities ahead of running any statement. Existing-
@@ -863,3 +1019,7 @@ introspection pipelines. Explicitly deferred:
   above); never guessed at or serialized incorrectly.
 - **A `tedious`-based connection pool source.** Only direct-connection
   wrapping (`fromTediousConnection`) exists today.
+- **`sqlcmd` scripting.** `:setvar`/`$(Variable)` substitution, `:r` file
+  includes, `:connect`, and shell escapes (`:!!`) are detected and rejected
+  with `UnsupportedSqlcmdDirectiveError`, never executed or expanded (see
+  "Restore" above).

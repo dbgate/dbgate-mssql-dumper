@@ -17,6 +17,7 @@ import type { ConnectionConfiguration, RequestError } from 'tedious';
 import { Connection, Request, TYPES } from 'tedious';
 import type {
   MssqlConnection,
+  MssqlExecBatchResult,
   MssqlParameterValue,
   MssqlQuery,
   MssqlQueryParameter,
@@ -26,6 +27,7 @@ import type {
   MssqlStreamOptions,
   MssqlTransactionStatus,
 } from './connection/types.js';
+import { safeSqlPreview } from './restore/batches.js';
 import { MssqlDumperError } from './utils/errors.js';
 
 /** Rows buffered ahead of the consumer before `stream()` pauses the underlying request. */
@@ -58,6 +60,16 @@ function wrapTediousError(error: RequestError | Error): MssqlDumperError {
 
 function isAbortSignalError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
+}
+
+/**
+ * A short, single-line label for a statement, for use in adapter-level error
+ * messages. Passed through the same credential redaction as restore previews,
+ * so a failing `CREATE LOGIN ... WITH PASSWORD = '...'` cannot put the
+ * password into an error message.
+ */
+function safeStatementLabel(sql: string): string {
+  return safeSqlPreview(sql, 60);
 }
 
 function inferTediousType(value: MssqlParameterValue): (typeof TYPES)[keyof typeof TYPES] {
@@ -120,20 +132,50 @@ function rowFromColumns<Row extends MssqlRow>(columns: unknown): Row {
 /** Adapts a connected `tedious.Connection` as one physical {@link MssqlConnection}. */
 export class TediousConnectionAdapter implements MssqlConnection {
   private readonly connection: Connection;
+  /** Description of the request currently occupying the connection, if any. */
+  private inFlight: string | null = null;
 
   constructor(connection: Connection) {
     this.connection = connection;
+  }
+
+  /**
+   * Guards against overlapping requests on one connection.
+   *
+   * TDS cannot interleave two requests on a single session, and tedious
+   * rejects the attempt with a cryptic `EINVALIDSTATE` ("Requests can only be
+   * made in the LoggedIn state, not the SentClientRequest state") that says
+   * nothing about which two operations collided. Detecting it here turns that
+   * into an actionable error naming both. Deliberately *not* a queue: silently
+   * serializing would turn a caller bug into a deadlock whenever the pending
+   * operation is itself waiting on the first one (a query issued while a
+   * `stream()` from the same connection is still being consumed).
+   */
+  private beginRequest(description: string): () => void {
+    if (this.inFlight !== null) {
+      throw new MssqlDumperError(
+        'connection-busy',
+        `Cannot start "${description}" while "${this.inFlight}" is still in flight on the same connection. ` +
+          `A single SQL Server session executes one request at a time: await each call (and finish consuming any stream()) before starting the next, or use a separate connection.`,
+      );
+    }
+    this.inFlight = description;
+    return () => {
+      this.inFlight = null;
+    };
   }
 
   async query<Row extends MssqlRow = MssqlRow>(
     query: MssqlQuery,
     signal?: AbortSignal,
   ): Promise<MssqlQueryResult<Row>> {
+    const endRequest = this.beginRequest(`query(${safeStatementLabel(query.sql)})`);
     return new Promise<MssqlQueryResult<Row>>((resolve, reject) => {
       const rows: Row[] = [];
       let columns: MssqlResultColumn[] = [];
 
       const request = new Request(query.sql, (error, rowCount) => {
+        endRequest();
         signal?.removeEventListener('abort', onAbort);
         if (error) {
           reject(isAbortSignalError(error) ? error : wrapTediousError(error));
@@ -156,7 +198,57 @@ export class TediousConnectionAdapter implements MssqlConnection {
       };
       signal?.addEventListener('abort', onAbort, { once: true });
 
-      this.connection.execSql(request);
+      // `execSql` can throw synchronously (tedious rejects a request made in
+      // the wrong connection state that way). Without this, the completion
+      // callback never runs, `endRequest()` is never called, and `inFlight`
+      // stays set — permanently bricking the adapter, since every later call
+      // then fails with `connection-busy`.
+      try {
+        this.connection.execSql(request);
+      } catch (error) {
+        endRequest();
+        signal?.removeEventListener('abort', onAbort);
+        reject(isAbortSignalError(error) ? error : wrapTediousError(error as Error));
+      }
+    });
+  }
+
+  /**
+   * Executes `sql` via `connection.execSqlBatch()` — sent as one TDS SQL
+   * batch, with no `sp_executesql` wrapping and no parameter support,
+   * exactly matching how `sqlcmd`/SSMS execute a `GO`-separated batch.
+   * `rowCount` in the completion callback is tedious's own running total
+   * across every `DONE`/`DONE_IN_PROC` token the batch produces, so a batch
+   * containing several `INSERT` statements (as `dumpMssql`'s data batches
+   * do) reports their combined row count, not just the last statement's.
+   */
+  async execBatch(sql: string, signal?: AbortSignal): Promise<MssqlExecBatchResult> {
+    const endRequest = this.beginRequest(`execBatch(${safeStatementLabel(sql)})`);
+    return new Promise<MssqlExecBatchResult>((resolve, reject) => {
+      const request = new Request(sql, (error, rowCount) => {
+        endRequest();
+        signal?.removeEventListener('abort', onAbort);
+        if (error) {
+          reject(isAbortSignalError(error) ? error : wrapTediousError(error));
+          return;
+        }
+        resolve({ rowsAffected: rowCount ?? 0 });
+      });
+
+      const onAbort = (): void => {
+        this.connection.cancel();
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+
+      // See the equivalent guard in `query()`: a synchronous throw here would
+      // otherwise leak `inFlight` and brick the adapter.
+      try {
+        this.connection.execSqlBatch(request);
+      } catch (error) {
+        endRequest();
+        signal?.removeEventListener('abort', onAbort);
+        reject(isAbortSignalError(error) ? error : wrapTediousError(error as Error));
+      }
     });
   }
 
@@ -175,8 +267,14 @@ export class TediousConnectionAdapter implements MssqlConnection {
     const signal = options?.signal;
     const highWaterMark = Math.max(1, options?.batchSize ?? DEFAULT_STREAM_HIGH_WATER_MARK);
     const lowWaterMark = Math.max(1, Math.floor(highWaterMark / 2));
+    // Claimed on the first `next()` (when the generator body starts) and
+    // released in its `finally`, so the connection stays reserved for as long
+    // as the caller is still consuming rows.
+    const beginRequest = (): (() => void) =>
+      this.beginRequest(`stream(${safeStatementLabel(query.sql)})`);
 
     const generator = async function* (): AsyncGenerator<Row> {
+      const endRequest = beginRequest();
       const queue: Row[] = [];
       let finished = false;
       let failure: unknown = null;
@@ -240,6 +338,7 @@ export class TediousConnectionAdapter implements MssqlConnection {
           });
         }
       } finally {
+        endRequest();
         signal?.removeEventListener('abort', onAbort);
         if (!finished) {
           // The consumer stopped iterating early (`break`/`return`) or the

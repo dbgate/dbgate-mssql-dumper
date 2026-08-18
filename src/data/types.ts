@@ -23,6 +23,18 @@ export interface TableDataExportOptions {
    * single statement. Defaults to 4,000,000 bytes.
    */
   readonly maxStatementBytes?: number;
+  /**
+   * Emit a `GO` batch separator after each generated `INSERT` statement
+   * (default `true`).
+   *
+   * Without it, a table's entire row data forms one enormous T-SQL batch:
+   * restoring it would exceed `SqlBatchParserOptions.maxBatchBytes`, require
+   * the whole thing to be buffered, and hand the server a single multi-hundred
+   * -megabyte batch. `SET IDENTITY_INSERT` is *session*-scoped, not
+   * batch-scoped, so splitting data across batches is safe. Turn it off only
+   * when generating SQL for a consumer that has no `GO` support at all.
+   */
+  readonly emitBatchSeparators?: boolean;
 }
 
 export interface TableDataExportRequest {
@@ -41,6 +53,17 @@ export interface TableDataExportRequest {
    * run, but callers that have a table model should always supply it.
    */
   readonly table?: MssqlTable;
+  /**
+   * Column names to `ORDER BY` when reading rows — normally the table's
+   * primary key, which `dumpMssql` passes automatically.
+   *
+   * Without an explicit order SQL Server makes no guarantee at all: a heap
+   * scan, a parallel plan, page splits, or a plan change can each reorder
+   * rows between two otherwise identical dumps, which breaks byte-comparing
+   * or hashing dump output. Row order is not semantically meaningful (keys
+   * are written explicitly), so this exists purely for reproducible output.
+   */
+  readonly orderByColumns?: readonly string[];
   readonly options?: TableDataExportOptions;
   readonly signal?: AbortSignal;
   readonly onProgress?: DumpProgressCallback;

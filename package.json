@@ -39,11 +39,17 @@
   "scripts": {
     "build": "tsup",
     "clean": "tsup --clean",
+    "docker:down": "docker compose -f integration/docker-compose.yml down -v",
+    "docker:logs": "docker compose -f integration/docker-compose.yml logs -f",
+    "docker:up": "docker compose -f integration/docker-compose.yml up -d --wait",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint . --max-warnings 0",
     "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build",
     "test": "vitest run",
+    "test:all": "npm run test && npm run test:integration",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration:docker": "npm run docker:up && npm run test:integration",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },

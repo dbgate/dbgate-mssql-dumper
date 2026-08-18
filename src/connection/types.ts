@@ -102,8 +102,29 @@ export interface MssqlConnection {
   /** Best-effort transaction status; adapters that cannot report it return `unknown`. */
   getTransactionStatus?(signal?: AbortSignal): Promise<MssqlTransactionStatus>;
 
+  /**
+   * Executes `sql` as one T-SQL batch, using genuine "batch" semantics —
+   * equivalent to Tedious's `execSqlBatch`, not `execSql` (which routes
+   * through `sp_executesql`). This distinction matters for restoring plain
+   * SQL scripts: `CREATE PROCEDURE`/`CREATE VIEW`/`CREATE FUNCTION`/
+   * `CREATE TRIGGER` must be the only statement in their batch and can
+   * behave differently (or be rejected outright) inside an `sp_executesql`
+   * wrapper, and batch-scoped constructs (local temp tables, `GOTO` labels,
+   * `SET` options meant to persist for later batches on the same
+   * connection) rely on not being sandboxed inside a nested execution
+   * context. No parameter binding is supported, matching `execSqlBatch`.
+   * Adapters that cannot distinguish batch execution from `query()` may
+   * omit this; callers fall back to `query()`.
+   */
+  execBatch?(sql: string, signal?: AbortSignal): Promise<MssqlExecBatchResult>;
+
   /** Requests cancellation of the currently executing statement, if any. */
   cancel(): Promise<void>;
+}
+
+/** Result of a batch execution via {@link MssqlConnection.execBatch}. */
+export interface MssqlExecBatchResult {
+  readonly rowsAffected: number;
 }
 
 /** A connection acquired from a pool-like source, plus its release callback. */

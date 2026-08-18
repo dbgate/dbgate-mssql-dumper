@@ -42,12 +42,22 @@ function completeRequest(request: Request, error: Error | null, rowCount?: numbe
  */
 function createFakeTediousConnection() {
   let currentRequest: Request | null = null;
+  let lastExecKind: 'execSql' | 'execSqlBatch' | null = null;
   let cancelCalls = 0;
   let closeCalls = 0;
+  /** When set, exec* throws synchronously, as tedious does for a wrong-state request. */
+  let execThrows: Error | null = null;
 
   const fake = {
     execSql(request: Request) {
+      if (execThrows) throw execThrows;
       currentRequest = request;
+      lastExecKind = 'execSql';
+    },
+    execSqlBatch(request: Request) {
+      if (execThrows) throw execThrows;
+      currentRequest = request;
+      lastExecKind = 'execSqlBatch';
     },
     cancel() {
       cancelCalls++;
@@ -65,6 +75,10 @@ function createFakeTediousConnection() {
   return {
     connection: fake as unknown as Connection,
     getCurrentRequest: () => currentRequest,
+    getLastExecKind: () => lastExecKind,
+    setExecSqlThrows: (error: Error | null) => {
+      execThrows = error;
+    },
     getCancelCalls: () => cancelCalls,
     getCloseCalls: () => closeCalls,
   };
@@ -134,6 +148,137 @@ describe('TediousConnectionAdapter.query', () => {
     await abortedPromise.catch(() => {});
 
     expect(fake.getCloseCalls()).toBe(0);
+  });
+});
+
+describe('TediousConnectionAdapter.execBatch', () => {
+  it('sends the SQL via execSqlBatch (not execSql), and resolves with the accumulated rowsAffected', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    const promise = adapter.execBatch('CREATE PROCEDURE dbo.P AS SELECT 1;');
+    expect(fake.getLastExecKind()).toBe('execSqlBatch');
+    const request = fake.getCurrentRequest()!;
+    completeRequest(request, null, 3);
+
+    await expect(promise).resolves.toEqual({ rowsAffected: 3 });
+  });
+
+  it('rejects with a wrapped error on failure', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    const promise = adapter.execBatch('CREATE PROCEDURE dbo.Bad AS this is not valid;');
+    const request = fake.getCurrentRequest()!;
+    completeRequest(request, new Error("Incorrect syntax near 'this'."));
+
+    await expect(promise).rejects.toThrow("Incorrect syntax near 'this'.");
+  });
+
+  it('cancels the connection and rejects when the signal is aborted', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+    const controller = new AbortController();
+
+    const promise = adapter.execBatch("WAITFOR DELAY '00:00:05';", controller.signal);
+    controller.abort();
+
+    await expect(promise).rejects.toThrow();
+    expect(fake.getCancelCalls()).toBe(1);
+  });
+
+  it('defaults rowsAffected to 0 when tedious reports no row count', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    const promise = adapter.execBatch('SET ANSI_NULLS ON;');
+    const request = fake.getCurrentRequest()!;
+    completeRequest(request, null, undefined);
+
+    await expect(promise).resolves.toEqual({ rowsAffected: 0 });
+  });
+});
+
+describe('TediousConnectionAdapter: one request at a time', () => {
+  it('rejects a query issued while a stream from the same connection is still being consumed', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    const iterator = adapter.stream({ sql: 'select * from Big' })[Symbol.asyncIterator]();
+    const first = iterator.next();
+    const request = fake.getCurrentRequest()!;
+    emitOn(request, 'row', row({ id: 1 }));
+    await first;
+
+    // TDS cannot interleave two requests on one session.
+    await expect(adapter.query({ sql: 'select 2' })).rejects.toThrow(
+      /connection-busy|Cannot start/,
+    );
+    await iterator.return?.(undefined);
+  });
+
+  it('names both the new and the in-flight operation, with statement text redacted', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    const pending = adapter.query({
+      sql: "CREATE LOGIN a WITH PASSWORD = 'super-secret-123'",
+    });
+    let message = '';
+    try {
+      await adapter.query({ sql: 'SELECT 2' });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain('SELECT 2');
+    expect(message).toContain('CREATE LOGIN');
+    expect(message).not.toContain('super-secret-123');
+
+    completeRequest(fake.getCurrentRequest()!, null, 0);
+    await pending;
+  });
+
+  it('releases the in-flight slot once the request completes, successfully or not', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    const failing = adapter.query({ sql: 'select 1/0' });
+    completeRequest(fake.getCurrentRequest()!, new Error('Divide by zero'));
+    await expect(failing).rejects.toThrow();
+
+    // A leaked slot would brick the adapter for every later call.
+    const next = adapter.query({ sql: 'select 1' });
+    completeRequest(fake.getCurrentRequest()!, null, 1);
+    await expect(next).resolves.toBeDefined();
+  });
+
+  it('releases the in-flight slot when execSql throws synchronously', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    // Tedious rejects a request made in the wrong connection state by throwing
+    // straight out of execSql, so the completion callback never runs.
+    fake.setExecSqlThrows(new Error('Requests can only be made in the LoggedIn state'));
+    await expect(adapter.query({ sql: 'select 1' })).rejects.toThrow(/LoggedIn state/);
+
+    fake.setExecSqlThrows(null);
+    const recovered = adapter.query({ sql: 'select 1' });
+    completeRequest(fake.getCurrentRequest()!, null, 1);
+    await expect(recovered).resolves.toBeDefined();
+  });
+
+  it('releases the in-flight slot when execSqlBatch throws synchronously', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    fake.setExecSqlThrows(new Error('Requests can only be made in the LoggedIn state'));
+    await expect(adapter.execBatch('select 1')).rejects.toThrow(/LoggedIn state/);
+
+    fake.setExecSqlThrows(null);
+    const recovered = adapter.execBatch('select 1');
+    completeRequest(fake.getCurrentRequest()!, null, 1);
+    await expect(recovered).resolves.toEqual({ rowsAffected: 1 });
   });
 });
 

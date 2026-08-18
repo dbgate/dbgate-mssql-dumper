@@ -44,7 +44,16 @@ export async function renderPlainSql(
   const lookups = buildRenderLookups(database);
 
   const emit = async (text: string): Promise<void> => {
-    const normalized = options.lineEnding === '\n' ? text : text.replace(/\n/g, options.lineEnding);
+    // Match whole line breaks, not a bare `\n`: much of what is emitted is
+    // verbatim catalog text (view/procedure/trigger definitions, check and
+    // default expressions, computed columns, index filters), and SQL Server
+    // stores those with CRLF whenever SSMS or any Windows client created
+    // them. Replacing only `\n` would turn an existing `\r\n` into `\r\r\n`,
+    // which is neither a valid line ending nor round-trippable. The `'\n'`
+    // default short-circuits entirely, so a CR that is genuinely *data*
+    // inside a string literal is left untouched in the common case.
+    const normalized =
+      options.lineEnding === '\n' ? text : text.replace(/\r\n|\r|\n/g, options.lineEnding);
     await writer.write(normalized + options.lineEnding, signal);
   };
 

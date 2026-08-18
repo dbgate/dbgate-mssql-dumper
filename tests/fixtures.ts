@@ -80,8 +80,8 @@ export function buildSampleDatabase(): MssqlDatabase {
             columnName: 'Id',
             ordinalPosition: 1,
             isIdentity: true,
-            identitySeed: 1,
-            identityIncrement: 1,
+            identitySeed: 1n,
+            identityIncrement: 1n,
           }),
           column({
             columnName: 'Name',
@@ -109,8 +109,8 @@ export function buildSampleDatabase(): MssqlDatabase {
             columnName: 'Id',
             ordinalPosition: 1,
             isIdentity: true,
-            identitySeed: 1,
-            identityIncrement: 1,
+            identitySeed: 1n,
+            identityIncrement: 1n,
           }),
           column({ columnName: 'CustomerId', ordinalPosition: 2 }),
           column({

@@ -68,7 +68,8 @@ export async function loadProgrammableDependencies(
         d.referenced_schema_name as referencedSchemaName,
         d.referenced_entity_name as referencedEntityName
       from sys.sql_expression_dependencies d
-      where d.referenced_class_desc = 'OBJECT_OR_COLUMN' and ${filter.clause}`,
+      where d.referenced_class_desc = 'OBJECT_OR_COLUMN' and ${filter.clause}
+      order by d.referencing_id, d.referenced_id, d.referenced_schema_name, d.referenced_entity_name`,
       parameters: [filter.parameter],
     },
     signal,

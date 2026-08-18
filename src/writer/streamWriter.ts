@@ -33,12 +33,26 @@ export class StreamDumpWriter implements DumpWriter {
     this.bytes += Buffer.byteLength(chunk, 'utf8');
 
     const canWriteMore = await new Promise<boolean>((resolve, reject) => {
+      const cleanup = (): void => {
+        this.stream.removeListener('error', onError);
+        signal?.removeEventListener('abort', onAbort);
+      };
       const onError = (error: Error): void => {
+        cleanup();
         reject(error);
       };
+      // Without this the promise settles only when the chunk is flushed, so
+      // aborting while the consumer is stalled would hang the whole dump
+      // forever — never resolving, never rejecting, never releasing the
+      // connection — instead of returning `cancelled: true` as documented.
+      const onAbort = (): void => {
+        cleanup();
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      };
       this.stream.once('error', onError);
+      signal?.addEventListener('abort', onAbort, { once: true });
       const ok = this.stream.write(chunk, 'utf8', (error?: Error | null) => {
-        this.stream.removeListener('error', onError);
+        cleanup();
         if (error) {
           reject(error);
         } else {
@@ -50,16 +64,28 @@ export class StreamDumpWriter implements DumpWriter {
     if (canWriteMore === false) {
       throwIfAborted(signal);
       await new Promise<void>((resolve, reject) => {
-        const onDrain = (): void => {
+        const cleanup = (): void => {
+          this.stream.removeListener('drain', onDrain);
           this.stream.removeListener('error', onError);
+          signal?.removeEventListener('abort', onAbort);
+        };
+        const onDrain = (): void => {
+          cleanup();
           resolve();
         };
         const onError = (error: Error): void => {
-          this.stream.removeListener('drain', onDrain);
+          cleanup();
           reject(error);
+        };
+        // A consumer that stopped reading never emits `drain`, so this await is
+        // exactly where a cancelled dump would otherwise stall indefinitely.
+        const onAbort = (): void => {
+          cleanup();
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
         };
         this.stream.once('drain', onDrain);
         this.stream.once('error', onError);
+        signal?.addEventListener('abort', onAbort, { once: true });
       });
     }
 

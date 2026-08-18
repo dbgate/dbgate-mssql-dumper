@@ -443,6 +443,7 @@ describe('inspectDumpArchive: sequence state vs. definition', () => {
           maxValue: null,
           isCycling: false,
           currentValue: 42n,
+          isCached: true,
           cacheSize: null,
           comment: null,
         },

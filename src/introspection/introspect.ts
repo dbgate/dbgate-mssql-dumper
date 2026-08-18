@@ -27,6 +27,7 @@ import {
 } from '../selection/normalize.js';
 import { detectSourceCapabilities } from '../version/capabilities.js';
 import { detectMssqlVersion } from '../version/detect.js';
+import type { DumpSelection } from '../selection/types.js';
 import type { IntrospectMssqlOptions, MssqlIntrospectionResult } from './types.js';
 
 /**
@@ -95,6 +96,8 @@ export async function introspectMssql(
           .map(t => t.objectId),
       );
 
+      diagnostics.push(...unmatchedSelectorDiagnostics(options.selection, allSchemas, allTables));
+
       const allViews = await loadViews(connection, signal);
       diagnostics.push(...allViews.diagnostics);
       const selectedViews = allViews.views.filter(view =>
@@ -144,12 +147,38 @@ export async function introspectMssql(
       const columnsByTable = await loadColumns(connection, finalTableIdList, signal);
 
       const selectedTableIdList = [...selectedTableIds];
-      const [defaultConstraints, keyConstraints, checkConstraints, indexes] = await Promise.all([
-        loadDefaultConstraints(connection, selectedTableIdList, allTableRefs, signal),
-        loadKeyConstraints(connection, selectedTableIdList, allTableRefs, signal),
-        loadCheckConstraints(connection, selectedTableIdList, allTableRefs, signal),
-        loadIndexes(connection, selectedTableIdList, allTableRefs, signal),
-      ]);
+      // Sequential, not `Promise.all`: every catalog query in this run shares
+      // one physical session, and TDS cannot interleave two requests on a
+      // single connection — a real driver rejects the second one outright
+      // ("Requests can only be made in the LoggedIn state"). There is nothing
+      // to gain from overlapping them either, since the server executes
+      // statements on one connection serially regardless.
+      const defaultConstraints = await loadDefaultConstraints(
+        connection,
+        selectedTableIdList,
+        allTableRefs,
+        signal,
+      );
+      // `finalTableIdList`, not `selectedTableIdList`: a table pulled in only as
+      // a foreign-key target still needs its PRIMARY KEY / UNIQUE constraint
+      // loaded, or the archive cannot emit the key the FK references and the
+      // dump is unrestorable. The archive planner decides which of these to
+      // actually emit (see `keyBearingTableKeys`).
+      const keyConstraints = await loadKeyConstraints(
+        connection,
+        finalTableIdList,
+        allTableRefs,
+        signal,
+      );
+      const checkConstraints = await loadCheckConstraints(
+        connection,
+        selectedTableIdList,
+        allTableRefs,
+        signal,
+      );
+      // Also `finalTableIdList`: a unique index is a legal foreign-key target,
+      // so a dependency table's unique indexes must be available to the planner.
+      const indexes = await loadIndexes(connection, finalTableIdList, allTableRefs, signal);
 
       const tables = allTables
         .filter(table => finalTableIds.has(table.objectId))
@@ -232,4 +261,63 @@ export async function introspectMssql(
   } finally {
     await acquired.release();
   }
+}
+
+/**
+ * Reports every selector that matched no catalog object.
+ *
+ * Selection is exact and case-sensitive by design, so a single typo — `Sales`
+ * for `sales`, or a singular table name — otherwise yields a dump containing
+ * nothing but the header, reported as a complete success with no warnings. A
+ * caller can believe they hold a backup they do not have, which is the worst
+ * possible failure mode for this library.
+ */
+function unmatchedSelectorDiagnostics(
+  selection: DumpSelection | undefined,
+  allSchemas: readonly { readonly schemaName: string }[],
+  allTables: readonly { readonly schemaName: string; readonly pureName: string }[],
+): MssqlDiagnostic[] {
+  if (!selection) {
+    return [];
+  }
+  const schemaNames = new Set(allSchemas.map(schema => schema.schemaName));
+  const tableKeys = new Set(allTables.map(table => `${table.schemaName}.${table.pureName}`));
+  const diagnostics: MssqlDiagnostic[] = [];
+
+  const reportSchema = (schemaName: string, option: string): void => {
+    if (!schemaNames.has(schemaName)) {
+      diagnostics.push({
+        severity: 'warning',
+        code: 'selection-matched-nothing',
+        message: `selection.${option} names schema "${schemaName}", which does not exist in this database; names are matched exactly and are case-sensitive`,
+        objectReference: { kind: 'schema', schemaName, name: schemaName },
+      });
+    }
+  };
+  const reportTable = (
+    selector: { readonly schemaName: string; readonly pureName: string },
+    option: string,
+  ): void => {
+    if (!tableKeys.has(`${selector.schemaName}.${selector.pureName}`)) {
+      diagnostics.push({
+        severity: 'warning',
+        code: 'selection-matched-nothing',
+        message: `selection.${option} names table "${selector.schemaName}"."${selector.pureName}", which does not exist in this database; names are matched exactly and are case-sensitive`,
+        objectReference: {
+          kind: 'table',
+          schemaName: selector.schemaName,
+          name: selector.pureName,
+        },
+      });
+    }
+  };
+
+  for (const schemaName of selection.schemas ?? []) reportSchema(schemaName, 'schemas');
+  for (const schemaName of selection.excludeSchemas ?? []) {
+    reportSchema(schemaName, 'excludeSchemas');
+  }
+  for (const selector of selection.tables ?? []) reportTable(selector, 'tables');
+  for (const selector of selection.excludeTables ?? []) reportTable(selector, 'excludeTables');
+
+  return diagnostics;
 }

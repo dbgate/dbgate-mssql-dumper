@@ -25,13 +25,17 @@ export function quoteDateTimeLiteral(value: Date): string {
 }
 
 /**
- * Renders a finite JS number as a plain decimal string, never exponential
- * notation. `String(value)` switches to exponential notation for
- * magnitudes `>= 1e21` or `< 1e-6`; T-SQL's exact-numeric literal grammar
- * (`int`/`bigint`/`decimal`/`numeric`/`money`) does not accept that form,
- * only its approximate-numeric (`float`/`real`) grammar does. Rather than
- * track which grammar applies at every call site, every numeric literal in
- * this package goes through this expansion so it is always valid for both.
+ * Renders a finite JS number as a plain decimal string for an **exact**
+ * numeric target (`int`/`bigint`/`decimal`/`numeric`/`money`/`smallmoney`),
+ * never exponential notation. `String(value)` switches to exponential
+ * notation for magnitudes `>= 1e21` or `< 1e-6`, and T-SQL's exact-numeric
+ * literal grammar does not accept that form.
+ *
+ * Do **not** use this for `float`/`real` — see
+ * {@link formatApproximateNumber}. Expanding a value near the edges of the
+ * double range (`1.7976931348623157e+308`) would produce a 309-digit plain
+ * literal, which SQL Server parses as `decimal` — whose maximum precision is
+ * 38 — and rejects outright.
  */
 export function formatFiniteNumber(value: number): string {
   if (!Number.isFinite(value)) {
@@ -62,6 +66,22 @@ export function formatFiniteNumber(value: number): string {
     expanded = `${digits.slice(0, pointIndex)}.${digits.slice(pointIndex)}`;
   }
   return negative ? `-${expanded}` : expanded;
+}
+
+/**
+ * Renders a finite JS number for an **approximate** numeric target
+ * (`float`/`real`) as JS's own shortest round-trip representation, keeping
+ * exponential notation when `String()` produces it. T-SQL's
+ * approximate-numeric literal grammar accepts exponential notation, and at
+ * the edges of the double range it is the only valid form (see
+ * {@link formatFiniteNumber}). Every representation this produces converts
+ * back to the identical double, so no precision is lost either way.
+ */
+export function formatApproximateNumber(value: number): string {
+  if (!Number.isFinite(value)) {
+    throw new Error(`Cannot render non-finite number as a SQL literal: ${value}`);
+  }
+  return String(value);
 }
 
 /**
@@ -132,7 +152,15 @@ export function renderSqlLiteral(value: SqlLiteralValue): string {
     return value.toString();
   }
   if (typeof value === 'number') {
-    return formatFiniteNumber(value);
+    // Type-unaware fallback. Plain-digit expansion is what an exact numeric
+    // target needs, but a magnitude at or beyond 1e21 would expand past
+    // `decimal`'s 38-digit maximum precision and be rejected — and a number
+    // that large (or a non-integer that small) can only have come from an
+    // approximate `float`/`real` value anyway, where exponential notation is
+    // the correct literal form. Choose per value rather than guessing a type.
+    return Number.isInteger(value) && Math.abs(value) < 1e21
+      ? formatFiniteNumber(value)
+      : formatApproximateNumber(value);
   }
   if (value instanceof Date) {
     return quoteDateTimeLiteral(value);

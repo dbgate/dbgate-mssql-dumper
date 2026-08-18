@@ -176,8 +176,9 @@ describe('loadColumns', () => {
     expect(columns[0]).toMatchObject({
       columnName: 'Id',
       isIdentity: true,
-      identitySeed: 1,
-      identityIncrement: 1,
+      // Kept at full bigint precision so a seed beyond 2^53 survives.
+      identitySeed: 1n,
+      identityIncrement: 1n,
       characterMaxLength: null,
     });
     expect(columns[1]).toMatchObject({

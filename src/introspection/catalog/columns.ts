@@ -1,7 +1,7 @@
 import type { MssqlColumnValue, MssqlConnection, MssqlRow } from '../../connection/types.js';
 import type { MssqlColumn } from '../../model/column.js';
 import { objectIdFilter } from './objectIdFilter.js';
-import { toSafeNumberOrNull } from './common.js';
+import { toBigIntOrNull } from './common.js';
 
 interface ColumnRow extends MssqlRow {
   readonly objectId: number;
@@ -103,8 +103,11 @@ export async function loadColumns(
       scale: row.scale,
       isNullable: row.isNullable,
       isIdentity: row.isIdentity,
-      identitySeed: toSafeNumberOrNull(row.identitySeed),
-      identityIncrement: toSafeNumberOrNull(row.identityIncrement),
+      // Kept at full bigint precision: the query already casts to `bigint`
+      // and Tedious returns it as an exact decimal string, so narrowing here
+      // would throw away precision the driver delivered intact.
+      identitySeed: toBigIntOrNull(row.identitySeed),
+      identityIncrement: toBigIntOrNull(row.identityIncrement),
       isComputed: row.computedExpression !== null,
       computedExpression: row.computedExpression,
       isPersisted: row.isPersisted,

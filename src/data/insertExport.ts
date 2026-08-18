@@ -48,8 +48,27 @@ export async function exportTableDataAsInserts(
   );
   const maxStatementBytes = Math.max(1, request.options?.maxStatementBytes ?? 4_000_000);
   const streamBatchSize = request.options?.streamBatchSize;
+  const emitBatchSeparators = request.options?.emitBatchSeparators ?? true;
 
   const emit = (text: string): Promise<void> => writer.write(`${text}\n`, signal);
+
+  /**
+   * Closes the current T-SQL batch. Without these, a large table's data would
+   * be one single batch — unrestorable past the batch-size limit and
+   * requiring the whole thing in memory on the way back in.
+   * `SET IDENTITY_INSERT` survives a batch boundary (it is session-scoped),
+   * so this is safe between the ON and OFF statements.
+   */
+  const emitBatchSeparator = async (): Promise<void> => {
+    if (emitBatchSeparators) {
+      await emit('GO');
+    }
+  };
+
+  const orderByClause =
+    request.orderByColumns && request.orderByColumns.length > 0
+      ? ` ORDER BY ${request.orderByColumns.map(name => quoteIdentifier(name)).join(', ')}`
+      : '';
 
   const warnings: MssqlDiagnostic[] = [];
   let rowsExported = 0;
@@ -64,7 +83,15 @@ export async function exportTableDataAsInserts(
         })
     : null;
 
-  const hasIdentityColumn = insertableColumns?.some(column => column.isIdentity) ?? false;
+  // Without a table model the identity column cannot be recognized from the
+  // model, yet `SELECT *` still selects it and the generated `INSERT` still
+  // names it — which fails at restore with "Cannot insert explicit value for
+  // identity column ... when IDENTITY_INSERT is set to OFF". One cheap
+  // catalog probe (fully parameterized) keeps the fallback path correct
+  // rather than silently emitting an unrestorable dump.
+  const hasIdentityColumn = insertableColumns
+    ? insertableColumns.some(column => column.isIdentity)
+    : await tableHasIdentityColumn(request);
   let identityInsertOpened = false;
 
   const progress = (): void => {
@@ -95,6 +122,9 @@ export async function exportTableDataAsInserts(
         throwIfAborted(signal);
         await emit(`INSERT INTO ${tableIdent} DEFAULT VALUES;`);
         rowsExported++;
+        if (rowsExported % maxRowsPerStatement === 0) {
+          await emitBatchSeparator();
+        }
         progress();
       }
     } else if (insertableColumns) {
@@ -109,12 +139,13 @@ export async function exportTableDataAsInserts(
           return;
         }
         await emit(`INSERT INTO ${tableIdent} (${columnList}) VALUES\n${batchTuples.join(',\n')};`);
+        await emitBatchSeparator();
         batchTuples = [];
         batchBytes = 0;
       };
 
       for await (const row of connection.stream(
-        { sql: `SELECT ${columnList} FROM ${tableIdent}` },
+        { sql: `SELECT ${columnList} FROM ${tableIdent}${orderByClause}` },
         { signal, batchSize: streamBatchSize },
       )) {
         throwIfAborted(signal);
@@ -138,7 +169,7 @@ export async function exportTableDataAsInserts(
       // contract), rendered with the JS-runtime-type-only generic literal renderer.
       let columns: string[] | null = null;
       for await (const row of connection.stream(
-        { sql: `SELECT * FROM ${tableIdent}` },
+        { sql: `SELECT * FROM ${tableIdent}${orderByClause}` },
         { signal, batchSize: streamBatchSize },
       )) {
         throwIfAborted(signal);
@@ -149,6 +180,9 @@ export async function exportTableDataAsInserts(
         const columnListText = columns.map(column => quoteIdentifier(column)).join(', ');
         await emit(`INSERT INTO ${tableIdent} (${columnListText}) VALUES (${values.join(', ')});`);
         rowsExported++;
+        if (rowsExported % maxRowsPerStatement === 0) {
+          await emitBatchSeparator();
+        }
         progress();
       }
     }
@@ -156,6 +190,7 @@ export async function exportTableDataAsInserts(
     if (identityInsertOpened) {
       await emit(`SET IDENTITY_INSERT ${tableIdent} OFF;`);
       identityInsertOpened = false;
+      await emitBatchSeparator();
     }
 
     return { rowsExported, bytesWritten: writer.bytesWritten, cancelled: false, warnings };
@@ -164,8 +199,14 @@ export async function exportTableDataAsInserts(
       // Best-effort: never leave the generated script with an unbalanced `SET IDENTITY_INSERT ON`
       // that would affect unrelated statements later in the same restore session. Swallow a
       // secondary failure here so it never masks the original error.
+      //
+      // Deliberately written *without* `signal`: the overwhelmingly common
+      // reason for landing here is that `signal` was just aborted, and passing
+      // it back into the writer would make this recovery write throw before
+      // emitting anything — guaranteeing the unbalanced `ON` it exists to
+      // prevent.
       try {
-        await emit(`SET IDENTITY_INSERT ${tableIdent} OFF;`);
+        await writer.write(`SET IDENTITY_INSERT ${tableIdent} OFF;\n`);
       } catch {
         // ignored
       }
@@ -175,4 +216,26 @@ export async function exportTableDataAsInserts(
     }
     throw error;
   }
+}
+
+/**
+ * Asks the catalog whether the table has an identity column, for the
+ * no-table-model fallback path. The table name travels as a bound parameter
+ * and is resolved by `OBJECT_ID`, never concatenated into the query text.
+ */
+async function tableHasIdentityColumn(request: TableDataExportRequest): Promise<boolean> {
+  const result = await request.connection.query<{ hasIdentity: number | null }>(
+    {
+      sql: "select objectproperty(object_id(@qualifiedName), 'TableHasIdentity') as hasIdentity",
+      parameters: [
+        {
+          name: 'qualifiedName',
+          value: quoteQualifiedIdentifier([request.schemaName, request.pureName]),
+          sqlType: 'NVarChar',
+        },
+      ],
+    },
+    request.signal,
+  );
+  return Number(result.rows[0]?.hasIdentity ?? 0) === 1;
 }

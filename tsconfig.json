@@ -17,5 +17,5 @@
     "noEmit": true,
     "outDir": "dist"
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests", "integration"]
 }

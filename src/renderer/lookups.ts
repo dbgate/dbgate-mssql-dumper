@@ -31,6 +31,18 @@ export interface RenderLookups {
 
 const key = (schemaName: string, name: string): string => `${schemaName}.${name}`;
 
+/**
+ * Index names are unique per *table*, not per schema — `IX_CustomerId` may
+ * legitimately exist on both `dbo.Orders` and `dbo.Invoices`. Keying indexes
+ * by schema+name alone would collapse the two into one map entry, so both
+ * archive entries would render whichever index happened to come last in
+ * `database.indexes` (server-assigned `object_id` order): one index emitted
+ * twice, the other silently dropped. Every other object kind this map holds
+ * really is schema-unique.
+ */
+export const indexKey = (schemaName: string, tableName: string, indexName: string): string =>
+  `${schemaName}.${tableName}.${indexName}`;
+
 export function buildRenderLookups(database: MssqlDatabase): RenderLookups {
   return {
     schemas: new Map(database.schemas.map(s => [key(s.schemaName, s.schemaName), s])),
@@ -54,6 +66,8 @@ export function buildRenderLookups(database: MssqlDatabase): RenderLookups {
     foreignKeys: new Map(
       database.foreignKeys.map(fk => [key(fk.schemaName, fk.constraintName), fk]),
     ),
-    indexes: new Map(database.indexes.map(ix => [key(ix.schemaName, ix.indexName), ix])),
+    indexes: new Map(
+      database.indexes.map(ix => [indexKey(ix.schemaName, ix.pureName, ix.indexName), ix]),
+    ),
   };
 }

@@ -259,8 +259,28 @@ export function inspectDumpArchive(
     addDependency(dumpId, ensureSchemaEntry(sequence.schemaName), 'hard');
   }
 
+  /**
+   * Tables that will be pulled into the archive purely to satisfy a selected
+   * table's foreign key.
+   *
+   * Such a table needs its PRIMARY KEY / UNIQUE constraint (and any unique
+   * index) emitted too, or the very foreign key that pulled it in cannot be
+   * created: `ALTER TABLE ... ADD FOREIGN KEY` fails with "There are no primary
+   * or candidate keys in the referenced table ... that match the referencing
+   * column list". Everything else about a dependency table — check and default
+   * constraints, non-unique indexes, its data — stays out, since it is present
+   * only as a reference target.
+   */
+  const foreignKeyTargetKeys = new Set<string>();
+  for (const fk of database.foreignKeys) {
+    if (selectedTableKeys.has(`${fk.schemaName}.${fk.pureName}`)) {
+      foreignKeyTargetKeys.add(`${fk.refSchemaName}.${fk.refTableName}`);
+    }
+  }
+  const keyBearingTableKeys = new Set([...selectedTableKeys, ...foreignKeyTargetKeys]);
+
   for (const pk of database.primaryKeys) {
-    if (!selectedTableKeys.has(`${pk.schemaName}.${pk.pureName}`)) {
+    if (!keyBearingTableKeys.has(`${pk.schemaName}.${pk.pureName}`)) {
       continue;
     }
     const dumpId = addEntry('primaryKey', pk.schemaName, pk.constraintName, pk.pureName);
@@ -271,13 +291,57 @@ export function inspectDumpArchive(
   }
 
   for (const uq of database.uniqueConstraints) {
-    if (!selectedTableKeys.has(`${uq.schemaName}.${uq.pureName}`)) {
+    if (!keyBearingTableKeys.has(`${uq.schemaName}.${uq.pureName}`)) {
       continue;
     }
     const dumpId = addEntry('uniqueConstraint', uq.schemaName, uq.constraintName, uq.pureName);
     const tableId = ensureTableEntry(uq.schemaName, uq.pureName);
     if (tableId) {
       addDependency(dumpId, tableId, 'hard');
+    }
+  }
+
+  /**
+   * Functions a `CHECK`/`DEFAULT` expression may call.
+   *
+   * SQL Server validates that a function exists at the moment the constraint is
+   * added — unlike procedures and triggers, which get deferred name resolution —
+   * so the function must be created first. The section priorities already place
+   * functions before constraints, but that is only a *tie-break*: a function
+   * carrying its own incoming edge (a schema-bound reference to a view, say) is
+   * not ready when post-data begins, so Kahn's algorithm emits the constraints
+   * first and the restore fails with "Cannot find either column ... or the
+   * user-defined function or aggregate".
+   *
+   * Matching is textual on the function's bare name, which is what the stored
+   * constraint definition contains. Conservative by design: a spurious edge is
+   * harmless (a function can never depend on a constraint, so this cannot create
+   * a cycle), and a miss just leaves the previous tie-break behaviour.
+   */
+  const functionEntries: { readonly pattern: RegExp; readonly dumpId: string }[] = [];
+  for (const routine of database.routines) {
+    if (routine.kind === 'procedure') {
+      continue;
+    }
+    const dumpId = objectDumpIdByQualifiedName.get(`${routine.schemaName}.${routine.pureName}`);
+    if (!dumpId) {
+      continue;
+    }
+    const escaped = routine.pureName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    functionEntries.push({
+      pattern: new RegExp(`(^|[^A-Za-z0-9_@#$])${escaped}([^A-Za-z0-9_@#$]|$)`, 'i'),
+      dumpId,
+    });
+  }
+
+  function addConstraintFunctionDependencies(dumpId: string, definition: string | null): void {
+    if (!definition) {
+      return;
+    }
+    for (const fn of functionEntries) {
+      if (fn.pattern.test(definition)) {
+        addDependency(dumpId, fn.dumpId, 'hard');
+      }
     }
   }
 
@@ -295,6 +359,7 @@ export function inspectDumpArchive(
     if (tableId) {
       addDependency(dumpId, tableId, 'hard');
     }
+    addConstraintFunctionDependencies(dumpId, check.definition);
   }
 
   for (const def of database.defaultConstraints) {
@@ -306,10 +371,15 @@ export function inspectDumpArchive(
     if (tableId) {
       addDependency(dumpId, tableId, 'hard');
     }
+    addConstraintFunctionDependencies(dumpId, def.definition);
   }
 
   for (const index of database.indexes) {
-    if (!selectedTableKeys.has(`${index.schemaName}.${index.pureName}`)) {
+    const indexTableKey = `${index.schemaName}.${index.pureName}`;
+    // A dependency table contributes only its *unique* indexes, which are legal
+    // foreign-key targets in SQL Server just as a constraint is.
+    const isNeededForForeignKey = foreignKeyTargetKeys.has(indexTableKey) && index.isUnique;
+    if (!selectedTableKeys.has(indexTableKey) && !isNeededForForeignKey) {
       continue;
     }
     const dumpId = addEntry('index', index.schemaName, index.indexName, index.pureName);
@@ -384,10 +454,43 @@ export function inspectDumpArchive(
       `${dependency.toSchemaName}.${dependency.toName}`,
     );
     if (!toDumpId) {
+      // Two very different situations share this branch, and they deserve
+      // different severities:
+      //
+      //  - the target was never introspected (dynamic SQL, a system object, a
+      //    hand-built test model): nothing is knowably wrong, so `info`.
+      //  - the target exists in the model but selection removed it: the
+      //    referencing module WILL fail to restore. `CREATE VIEW` and
+      //    `CREATE FUNCTION` have no deferred name resolution, so the batch
+      //    errors with "Invalid object name" — that is a `warning` at least,
+      //    and a strict-selection violation when the caller asked for strict.
+      const targetKey = `${dependency.toSchemaName}.${dependency.toName}`;
+      // The target may still be in the model when the caller built one by hand;
+      // for a real introspection run the excluded object is already gone from
+      // it, so the caller's own explicit exclusions are the reliable signal.
+      // Only explicit exclusions are consulted, never a mere absence, so a
+      // reference to a system object (never in the archive, never excluded by
+      // the caller) stays at `info` instead of producing a false alarm.
+      const targetExistsInModel =
+        database.tables.some(t => `${t.schemaName}.${t.pureName}` === targetKey) ||
+        database.views.some(v => `${v.schemaName}.${v.pureName}` === targetKey) ||
+        database.routines.some(r => `${r.schemaName}.${r.pureName}` === targetKey) ||
+        database.sequences.some(s => `${s.schemaName}.${s.pureName}` === targetKey);
+      const excludedBySelection =
+        targetExistsInModel ||
+        selection.excludeTables.has(targetKey) ||
+        selection.excludeSchemas.has(dependency.toSchemaName);
+      if (excludedBySelection && options.strictSelection) {
+        hasStrictViolation = true;
+      }
       diagnostics.push({
-        severity: 'info',
-        code: 'unresolved-programmable-dependency',
-        message: `"${dependency.fromSchemaName}"."${dependency.fromName}" references "${dependency.toSchemaName}"."${dependency.toName}", which is not part of this archive (excluded by selection, or not introspected)`,
+        severity: excludedBySelection ? (options.strictSelection ? 'error' : 'warning') : 'info',
+        code: excludedBySelection
+          ? 'dependency-excluded-by-selection'
+          : 'unresolved-programmable-dependency',
+        message: excludedBySelection
+          ? `"${dependency.fromSchemaName}"."${dependency.fromName}" references "${dependency.toSchemaName}"."${dependency.toName}", which this selection excludes; the referencing object will fail to restore because SQL Server resolves names for it eagerly`
+          : `"${dependency.fromSchemaName}"."${dependency.fromName}" references "${dependency.toSchemaName}"."${dependency.toName}", which is not part of this archive (excluded by selection, or not introspected)`,
         objectReference: {
           kind: dependency.fromKind,
           schemaName: dependency.fromSchemaName,
@@ -400,6 +503,7 @@ export function inspectDumpArchive(
   }
 
   if (mode !== 'schema-only') {
+    const dataDumpIdByTableKey = new Map<string, string>();
     for (const key of selectedTableKeys) {
       const tableId = tableDumpId.get(key);
       const table = database.tables.find(t => `${t.schemaName}.${t.pureName}` === key);
@@ -407,7 +511,28 @@ export function inspectDumpArchive(
         continue;
       }
       const dataDumpId = addEntry('tableData', table.schemaName, table.pureName, table.pureName);
+      dataDumpIdByTableKey.set(key, dataDumpId);
       addDependency(dataDumpId, tableId, 'hard');
+    }
+
+    // Order row loads parent-before-child along foreign keys.
+    //
+    // In `full` mode this is redundant — every foreign key is post-data, so no
+    // constraint exists while data loads. `data-only` removes that protection:
+    // the target already has the foreign keys, so inserting a child row before
+    // its parent fails with "The INSERT statement conflicted with the FOREIGN
+    // KEY constraint". Without an edge the fallback is alphabetical, which puts
+    // `dbo.Orders` before `dbo.Users`.
+    //
+    // `preference`, not `hard`, so mutually referencing or cyclic foreign keys
+    // are resolved by the existing edge-peeling pass instead of invalidating the
+    // archive — such a cycle genuinely cannot be satisfied by ordering alone.
+    for (const fk of database.foreignKeys) {
+      const childDataId = dataDumpIdByTableKey.get(`${fk.schemaName}.${fk.pureName}`);
+      const parentDataId = dataDumpIdByTableKey.get(`${fk.refSchemaName}.${fk.refTableName}`);
+      if (childDataId && parentDataId) {
+        addDependency(childDataId, parentDataId, 'preference');
+      }
     }
 
     for (const sequence of database.sequences) {
@@ -484,7 +609,14 @@ export function inspectDumpArchive(
     };
   }
 
-  const result: ArchiveEntry[] = sorted.map((entry, index) => toArchiveEntry(entry, index));
+  // A strict-selection violation makes the archive invalid, and
+  // `ArchiveEntry.sequenceNumber` is documented as absent for an invalid
+  // archive ("no such order exists") — the same contract the unresolved-cycle
+  // path already honours. Without this, a caller testing
+  // `sequenceNumber === undefined` to detect an unusable archive is misled.
+  const result: ArchiveEntry[] = sorted.map((entry, index) =>
+    toArchiveEntry(entry, hasStrictViolation ? undefined : index),
+  );
 
   return {
     valid: !hasStrictViolation,

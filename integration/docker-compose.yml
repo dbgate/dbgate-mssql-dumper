@@ -1,0 +1,33 @@
+# SQL Server instance used by the integration/round-trip tests.
+#
+#   npm run docker:up      # start and wait until it accepts logins
+#   npm run test:integration
+#   npm run docker:down    # stop and remove the volume
+#
+# Port 14330 is deliberately non-default so this never collides with a local
+# SQL Server install or another project's test container on 1433.
+#
+# NOTE: the healthcheck below shells out to the sqlcmd binary that ships
+# inside the SQL Server image. That is unrelated to this library's own
+# "never invoke an external executable" rule — the library under test does
+# all of its work over TDS through the MssqlConnection abstraction. This is
+# only a container-side readiness probe so `docker compose up --wait` can
+# block until the instance actually accepts logins.
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: dbgate-mssql-dumper-test
+    environment:
+      ACCEPT_EULA: 'Y'
+      MSSQL_SA_PASSWORD: 'Str0ng!Passw0rd#2024'
+      MSSQL_PID: Developer
+    ports:
+      - '14330:1433'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" || exit 1
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 15s

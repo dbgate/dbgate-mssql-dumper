@@ -58,6 +58,18 @@ export async function dumpMssql(
     const tablesByKey = new Map<string, MssqlTable>(
       introspection.database.tables.map(table => [`${table.schemaName}.${table.pureName}`, table]),
     );
+    // Row data is read in primary-key order so two dumps of the same database
+    // are byte-identical. Without an explicit ORDER BY, SQL Server is free to
+    // return rows in any order (heap scans, parallel plans, page splits), and
+    // this package's determinism guarantee would not extend to data.
+    const primaryKeyColumnsByTable = new Map<string, readonly string[]>(
+      introspection.database.primaryKeys.map(primaryKey => [
+        `${primaryKey.schemaName}.${primaryKey.pureName}`,
+        [...primaryKey.columns]
+          .sort((a, b) => a.ordinalPosition - b.ordinalPosition)
+          .map(column => column.columnName),
+      ]),
+    );
 
     let rowsExported = 0;
     const dataExportWarnings: MssqlDiagnostic[] = [];
@@ -68,13 +80,15 @@ export async function dumpMssql(
         // renderer's default "not rendered" warning for that entry.
         return false;
       }
-      const table = tablesByKey.get(`${entry.schemaName}.${entry.name}`);
+      const tableKey = `${entry.schemaName}.${entry.name}`;
+      const table = tablesByKey.get(tableKey);
       const result = await exportTableDataAsInserts({
         connection: acquired.connection,
         schemaName: entry.schemaName,
         pureName: entry.name,
         writer,
         table,
+        orderByColumns: primaryKeyColumnsByTable.get(tableKey),
         options: options.dataExport,
         signal,
         onProgress,

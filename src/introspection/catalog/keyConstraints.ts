@@ -47,7 +47,7 @@ export async function loadKeyConstraints(
         kc.parent_object_id as objectId,
         kc.name as constraintName,
         kc.type as constraintType,
-        i.is_clustered as isClustered,
+        cast(case when i.type = 1 then 1 else 0 end as bit) as isClustered,
         ic.key_ordinal as keyOrdinal,
         ic.is_descending_key as isDescending,
         col.name as columnName
