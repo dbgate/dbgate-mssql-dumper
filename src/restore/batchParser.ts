@@ -15,12 +15,12 @@ const GO_LINE_PATTERN = /^\s*GO(?:\s+(\d+))?\s*(?:--.*)?$/i;
 /** Matches any line that *starts* with the standalone word `GO` (used to detect a malformed attempt). */
 const GO_WORD_AT_LINE_START = /^\s*GO\b/i;
 /**
- * `sqlcmd` scripting commands (`:r`, `:setvar`, `:connect`, `:!!`, ...) are
+ * `sqlcmd` scripting commands (`:r`, `:setvar`, `:connect`, `!!`, ...) are
  * only recognized starting in column 1 by `sqlcmd` itself; requiring the
  * same here avoids mistaking indented T-SQL (a `CASE`/label construct using
  * `:`, or a `::` static method call) for a directive.
  */
-const SQLCMD_DIRECTIVE_PATTERN = /^:(!!|[A-Za-z][A-Za-z0-9]*)/;
+const SQLCMD_DIRECTIVE_PATTERN = /^(?:!!|:(?:!!|[A-Za-z][A-Za-z0-9]*))/;
 /** A `sqlcmd` variable substitution token, recognized outside strings/comments/brackets. */
 const SQLCMD_VARIABLE_PATTERN = /^\$\(([^)]*)\)/;
 

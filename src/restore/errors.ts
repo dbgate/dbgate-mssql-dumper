@@ -63,7 +63,7 @@ export class InvalidGoRepeatCountError extends SqlBatchParseError {
 /**
  * A `sqlcmd` scripting construct was found outside any string/comment —
  * either a colon-prefixed directive (`:r`, `:setvar`, `:connect`, `:!!`,
- * ...) or a `$(Variable)` substitution token. These are preprocessed by
+ * ...), a standard `!!` shell escape, or a `$(Variable)` substitution token. These are preprocessed by
  * `sqlcmd`/SSMS before the batch ever reaches SQL Server; this package
  * executes batches directly against the connection and does not implement a
  * `sqlcmd` preprocessor, so a script relying on one cannot be restored

@@ -159,14 +159,14 @@ than throwing.
 ## `sqlcmd` directives: detected and rejected
 
 `sqlcmd`/SSMS preprocess a script — expanding `$(Variable)`, running `:r`
-includes, executing `:!!` shell escapes — before anything reaches SQL Server.
+includes, executing `!!`/`:!!` shell escapes — before anything reaches SQL Server.
 This package executes batches directly and implements no such preprocessor.
 Rather than forward an unresolved token to the server (producing a confusing
 native syntax error, or in principle executing as unintended T-SQL), the parser
 detects and rejects them:
 
-- a colon directive (`:r`, `:setvar`, `:connect`, `:on error`, `:!!`, …)
-  recognized only when the colon is in **column 1**, matching `sqlcmd` itself —
+- a colon directive (`:r`, `:setvar`, `:connect`, `:on error`, `:!!`, …) or a
+  standard `!!` shell escape, recognized only when it starts in **column 1** —
   so indented T-SQL containing a colon (a label, or `geography::STGeomFromText`)
   is not a false positive
 - a `$(Variable)` token outside any string/comment/bracket; a `$(…)`-shaped

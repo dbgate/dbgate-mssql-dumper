@@ -186,14 +186,18 @@ describe('parseSqlBatches: invalid GO repeat counts', () => {
 });
 
 describe('parseSqlBatches: unsupported sqlcmd directives', () => {
-  it.each([':setvar DbName MyDb', ':r shared.sql', ':connect server', ':!! dir', ':on error exit'])(
-    'rejects the sqlcmd directive "%s"',
-    directiveLine => {
-      expect(() => parseSqlBatches(`${directiveLine}\nSELECT 1;\nGO\n`)).toThrow(
-        UnsupportedSqlcmdDirectiveError,
-      );
-    },
-  );
+  it.each([
+    ':setvar DbName MyDb',
+    ':r shared.sql',
+    ':connect server',
+    ':!! dir',
+    '!! command',
+    ':on error exit',
+  ])('rejects the sqlcmd directive "%s"', directiveLine => {
+    expect(() => parseSqlBatches(`${directiveLine}\nSELECT 1;\nGO\n`)).toThrow(
+      UnsupportedSqlcmdDirectiveError,
+    );
+  });
 
   it('rejects a $(Variable) substitution token outside any string/comment', () => {
     expect(() => parseSqlBatches('USE $(DbName);\nGO\n')).toThrow(UnsupportedSqlcmdDirectiveError);
@@ -207,6 +211,13 @@ describe('parseSqlBatches: unsupported sqlcmd directives', () => {
   it('does not flag an indented colon, since sqlcmd directives must start in column 1', () => {
     const batches = parseSqlBatches('  :setvar Looks Like A Directive But Is Indented\nGO\n');
     expect(batches).toHaveLength(1);
+  });
+
+  it('does not mistake !! text inside a multiline string or comment for a shell escape', () => {
+    const batches = parseSqlBatches(
+      "PRINT 'line one\n!! literal text';\n/*\n!! comment text\n*/\nGO\n",
+    );
+    expect(sqlOf(batches)).toEqual(["PRINT 'line one\n!! literal text';\n/*\n!! comment text\n*/"]);
   });
 
   it('reports the offending line number and directive text', () => {

@@ -136,6 +136,25 @@ describe('renderColumnValue', () => {
     expect(renderColumnValue(huge, col)).toBe(huge);
   });
 
+  it('expands driver-supplied scientific notation exactly instead of converting through Number', () => {
+    const decimal = column({ columnName: 'Amount', dataType: 'decimal', precision: 38, scale: 10 });
+    const bigint = column({ columnName: 'Id', dataType: 'bigint' });
+
+    expect(renderColumnValue('1.234567890123456789e+20', decimal)).toBe('123456789012345678900');
+    expect(renderColumnValue('1.2300e-5', decimal)).toBe('0.000012300');
+    expect(renderColumnValue('-9.007199254740993e15', bigint)).toBe('-9007199254740993');
+  });
+
+  it('keeps safe scientific notation for approximate numeric strings', () => {
+    const col = column({ columnName: 'Value', dataType: 'float' });
+    expect(renderColumnValue('1.7976931348623157e+308', col)).toBe('1.7976931348623157e+308');
+  });
+
+  it('rejects a pathological exact-numeric exponent without unbounded expansion', () => {
+    const col = column({ columnName: 'Amount', dataType: 'decimal', precision: 38, scale: 0 });
+    expect(() => renderColumnValue('1e999999999999999999999', col)).toThrow(/exponent/);
+  });
+
   it('quotes a decimal string that is not safe numeric text, rather than emitting it bare', () => {
     const col = column({ columnName: 'Amount', dataType: 'decimal' });
     expect(renderColumnValue('1;DROP TABLE T', col)).toBe("'1;DROP TABLE T'");
@@ -207,9 +226,27 @@ describe('renderColumnValue', () => {
     );
   });
 
+  it('preserves empty, control, Unicode, combining, and repeated-apostrophe text', () => {
+    const col = column({ columnName: 'Text', dataType: 'nvarchar' });
+    for (const value of ['', '\r', '\n', '\r\n', '\t', '\\', 'ðŸ˜€', 'åŒ—äº¬', 'e\u0301']) {
+      expect(renderColumnValue(value, col)).toBe(`N'${value}'`);
+    }
+    expect(renderColumnValue("a''b'''c", col)).toBe("N'a''''b''''''c'");
+  });
+
   it('renders binary/varbinary/image as 0x hex', () => {
     const col = column({ columnName: 'Data', dataType: 'varbinary' });
     expect(renderColumnValue(Buffer.from([0x00, 0xff, 0xab]), col)).toBe('0x00ffab');
+  });
+
+  it('renders empty and large binary values without truncation', () => {
+    const col = column({ columnName: 'Data', dataType: 'varbinary' });
+    expect(renderColumnValue(Buffer.alloc(0), col)).toBe('0x');
+    const large = Buffer.alloc(128 * 1024, 0xab);
+    const rendered = renderColumnValue(large, col);
+    expect(rendered).toHaveLength(2 + large.length * 2);
+    expect(rendered.startsWith('0xabab')).toBe(true);
+    expect(rendered.endsWith('abab')).toBe(true);
   });
 
   it('renders uniqueidentifier as a quoted GUID string', () => {

@@ -4,7 +4,7 @@ Two independent suites:
 
 | Command                    | What it runs                                               | Needs             |
 | -------------------------- | ---------------------------------------------------------- | ----------------- |
-| `npm test`                 | Unit tests (`tests/**`) — 329 tests                        | nothing           |
+| `npm test`                 | Unit tests (`tests/**`) — 341 tests                        | nothing           |
 | `npm run test:integration` | Integration/round-trip tests (`integration/**`) — 58 tests | a live SQL Server |
 
 `npm test` stays fast and hermetic: no Docker, no network, no server. All

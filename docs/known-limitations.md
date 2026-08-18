@@ -75,7 +75,7 @@ the target already has the same principals.
 ## Restore
 
 - **No `sqlcmd` scripting.** `:setvar`, `$(Variable)` substitution, `:r`
-  includes, `:connect`, `:on error` and `:!!` shell escapes are **detected and
+  includes, `:connect`, `:on error` and `!!` shell escapes are **detected and
   rejected** with `UnsupportedSqlcmdDirectiveError` — never expanded, never
   forwarded to the server. This is a documented subset of `sqlcmd`, not
   compatibility with it.

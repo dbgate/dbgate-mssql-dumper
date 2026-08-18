@@ -28,7 +28,7 @@ import type {
   MssqlTransactionStatus,
 } from './connection/types.js';
 import { safeSqlPreview } from './restore/batches.js';
-import { MssqlDumperError } from './utils/errors.js';
+import { MssqlDumperError, OperationCancelledError, throwIfAborted } from './utils/errors.js';
 
 /** Rows buffered ahead of the consumer before `stream()` pauses the underlying request. */
 const DEFAULT_STREAM_HIGH_WATER_MARK = 50;
@@ -184,7 +184,10 @@ export class TediousConnectionAdapter implements MssqlConnection {
       );
     }
     this.inFlight = description;
+    let ended = false;
     return () => {
+      if (ended) return;
+      ended = true;
       this.inFlight = null;
     };
   }
@@ -193,6 +196,7 @@ export class TediousConnectionAdapter implements MssqlConnection {
     query: MssqlQuery,
     signal?: AbortSignal,
   ): Promise<MssqlQueryResult<Row>> {
+    throwIfAborted(signal);
     const endRequest = this.beginRequest(`query(${safeStatementLabel(query.sql)})`);
     return new Promise<MssqlQueryResult<Row>>((resolve, reject) => {
       const rows: Row[] = [];
@@ -218,6 +222,11 @@ export class TediousConnectionAdapter implements MssqlConnection {
       });
 
       const onAbort = (): void => {
+        // Settle promptly even if a mocked/broken driver never invokes the
+        // request callback after cancel. The in-flight slot is intentionally
+        // retained until that callback arrives, because TDS may still be
+        // processing the attention acknowledgement.
+        reject(new OperationCancelledError());
         this.connection.cancel();
       };
       signal?.addEventListener('abort', onAbort, { once: true });
@@ -247,6 +256,7 @@ export class TediousConnectionAdapter implements MssqlConnection {
    * do) reports their combined row count, not just the last statement's.
    */
   async execBatch(sql: string, signal?: AbortSignal): Promise<MssqlExecBatchResult> {
+    throwIfAborted(signal);
     const endRequest = this.beginRequest(`execBatch(${safeStatementLabel(sql)})`);
     return new Promise<MssqlExecBatchResult>((resolve, reject) => {
       const request = new Request(sql, (error, rowCount) => {
@@ -260,6 +270,7 @@ export class TediousConnectionAdapter implements MssqlConnection {
       });
 
       const onAbort = (): void => {
+        reject(new OperationCancelledError());
         this.connection.cancel();
       };
       signal?.addEventListener('abort', onAbort, { once: true });
@@ -298,6 +309,7 @@ export class TediousConnectionAdapter implements MssqlConnection {
       this.beginRequest(`stream(${safeStatementLabel(query.sql)})`);
 
     const generator = async function* (): AsyncGenerator<Row> {
+      throwIfAborted(signal);
       const endRequest = beginRequest();
       const queue: Row[] = [];
       let finished = false;
@@ -311,7 +323,7 @@ export class TediousConnectionAdapter implements MssqlConnection {
 
       const request = new Request(query.sql, error => {
         finished = true;
-        if (error) {
+        if (error && failure === null) {
           failure = isAbortSignalError(error) ? error : wrapTediousError(error);
         }
         wake();
@@ -327,12 +339,17 @@ export class TediousConnectionAdapter implements MssqlConnection {
         wake();
       });
       request.on('error', (error: Error) => {
-        failure = wrapTediousError(error);
+        if (failure === null) {
+          failure = wrapTediousError(error);
+        }
         finished = true;
         wake();
       });
 
       const onAbort = (): void => {
+        failure = new OperationCancelledError();
+        finished = true;
+        wake();
         connection.cancel();
       };
       signal?.addEventListener('abort', onAbort, { once: true });

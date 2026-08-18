@@ -153,7 +153,43 @@ export function columnExportDiagnostics(
 }
 
 /** A numeric-looking string: safe to emit as a bare literal without any risk of breaking statement syntax. */
-const SAFE_NUMERIC_TEXT = /^-?\d+(\.\d+)?$/;
+const SAFE_NUMERIC_TEXT = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+
+/**
+ * Expands scientific notation without passing through a JS number. Exact SQL
+ * numerics must not be routed through `float` merely because a client returned
+ * their text in exponent form: doing so can lose significant digits before
+ * SQL Server converts the value to the target decimal/bigint column.
+ */
+function formatExactNumericText(value: string, match: RegExpExecArray): string {
+  const exponentText = match[5];
+  if (exponentText === undefined) {
+    return value;
+  }
+
+  const exponent = Number(exponentText);
+  // SQL Server exact numerics top out at precision 38. This generous bound is
+  // only a memory-safety guard against a malicious exponent with millions of
+  // digits; an out-of-range but reasonably sized literal is left for SQL
+  // Server to reject with its normal overflow error.
+  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 1_000) {
+    throw new Error(`Cannot render exact numeric text with exponent ${exponentText}`);
+  }
+
+  const sign = match[1] === '-' ? '-' : '';
+  const integer = match[2] ?? '0';
+  const fraction = match[2] === undefined ? (match[4] ?? '') : (match[3] ?? '');
+  const digits = integer + fraction;
+  const point = integer.length + exponent;
+
+  if (point <= 0) {
+    return `${sign}0.${'0'.repeat(-point)}${digits}`;
+  }
+  if (point >= digits.length) {
+    return `${sign}${digits}${'0'.repeat(point - digits.length)}`;
+  }
+  return `${sign}${digits.slice(0, point)}.${digits.slice(point)}`;
+}
 
 /**
  * Renders one column's value using the target SQL Server type to choose
@@ -194,7 +230,9 @@ export function renderColumnValue(value: MssqlColumnValue, column: MssqlColumn):
     // SAFE_NUMERIC_TEXT first so unexpected text can never break statement
     // syntax; anything else is quoted defensively.
     if (typeof value === 'string') {
-      return SAFE_NUMERIC_TEXT.test(value) ? value : quoteStringLiteral(value);
+      const match = SAFE_NUMERIC_TEXT.exec(value);
+      if (!match) return quoteStringLiteral(value);
+      return APPROXIMATE_NUMERIC_TYPES.has(type) ? value : formatExactNumericText(value, match);
     }
     if (typeof value === 'bigint') return value.toString();
     if (typeof value === 'number') {

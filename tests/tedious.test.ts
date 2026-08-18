@@ -45,6 +45,7 @@ function createFakeTediousConnection() {
   let lastExecKind: 'execSql' | 'execSqlBatch' | null = null;
   let cancelCalls = 0;
   let closeCalls = 0;
+  let completeOnCancel = true;
   /** When set, exec* throws synchronously, as tedious does for a wrong-state request. */
   let execThrows: Error | null = null;
 
@@ -63,9 +64,11 @@ function createFakeTediousConnection() {
       cancelCalls++;
       // Approximates tedious's real behavior: cancelling in-flight work
       // eventually completes the request with an error.
-      (currentRequest as unknown as { callback: (err: Error) => void } | null)?.callback(
-        new Error('Canceled.'),
-      );
+      if (completeOnCancel) {
+        (currentRequest as unknown as { callback: (err: Error) => void } | null)?.callback(
+          new Error('Canceled.'),
+        );
+      }
     },
     close() {
       closeCalls++;
@@ -78,6 +81,9 @@ function createFakeTediousConnection() {
     getLastExecKind: () => lastExecKind,
     setExecSqlThrows: (error: Error | null) => {
       execThrows = error;
+    },
+    setCompleteOnCancel: (value: boolean) => {
+      completeOnCancel = value;
     },
     getCancelCalls: () => cancelCalls,
     getCloseCalls: () => closeCalls,
@@ -131,6 +137,33 @@ describe('TediousConnectionAdapter.query', () => {
 
     await expect(promise).rejects.toThrow();
     expect(fake.getCancelCalls()).toBe(1);
+  });
+
+  it('does not start a request for an already-aborted signal', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(adapter.query({ sql: 'select 1' }, controller.signal)).rejects.toMatchObject({
+      code: 'operation-cancelled',
+    });
+    expect(fake.getCurrentRequest()).toBeNull();
+  });
+
+  it('settles promptly even when cancel does not invoke the tedious callback', async () => {
+    const fake = createFakeTediousConnection();
+    fake.setCompleteOnCancel(false);
+    const adapter = new TediousConnectionAdapter(fake.connection);
+    const controller = new AbortController();
+
+    const promise = adapter.query({ sql: 'select 1' }, controller.signal);
+    controller.abort();
+
+    await expect(promise).rejects.toMatchObject({ code: 'operation-cancelled' });
+    expect(fake.getCancelCalls()).toBe(1);
+    // Release the deliberately uncooperative fake's in-flight request.
+    completeRequest(fake.getCurrentRequest()!, new Error('Canceled.'));
   });
 
   it('never closes the caller-owned connection', async () => {
@@ -197,6 +230,17 @@ describe('TediousConnectionAdapter.execBatch', () => {
 
     await expect(promise).resolves.toEqual({ rowsAffected: 0 });
   });
+
+  it('applies the per-query timeout to the tedious request', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    const queryPromise = adapter.query({ sql: 'select 1', timeoutMs: 1234 });
+    const queryRequest = fake.getCurrentRequest()!;
+    expect((queryRequest as unknown as { timeout: number }).timeout).toBe(1234);
+    completeRequest(queryRequest, null, 1);
+    await queryPromise;
+  });
 });
 
 describe('TediousConnectionAdapter: one request at a time', () => {
@@ -251,6 +295,26 @@ describe('TediousConnectionAdapter: one request at a time', () => {
     const next = adapter.query({ sql: 'select 1' });
     completeRequest(fake.getCurrentRequest()!, null, 1);
     await expect(next).resolves.toBeDefined();
+  });
+
+  it('does not let a duplicate stale callback release a newer in-flight request', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    const first = adapter.query({ sql: 'select 1' });
+    const firstRequest = fake.getCurrentRequest()!;
+    completeRequest(firstRequest, null, 1);
+    await first;
+
+    const second = adapter.query({ sql: 'select 2' });
+    const secondRequest = fake.getCurrentRequest()!;
+    completeRequest(firstRequest, null, 1);
+    await expect(adapter.query({ sql: 'select 3' })).rejects.toMatchObject({
+      code: 'connection-busy',
+    });
+
+    completeRequest(secondRequest, null, 1);
+    await second;
   });
 
   it('releases the in-flight slot when execSql throws synchronously', async () => {
@@ -341,6 +405,24 @@ describe('TediousConnectionAdapter.stream', () => {
     controller.abort();
 
     await expect(pending).rejects.toThrow();
+    expect(fake.getCancelCalls()).toBe(1);
+  });
+
+  it('wakes a paused/waiting stream promptly when cancel has no completion callback', async () => {
+    const fake = createFakeTediousConnection();
+    fake.setCompleteOnCancel(false);
+    const adapter = new TediousConnectionAdapter(fake.connection);
+    const controller = new AbortController();
+    const stream = adapter.stream(
+      { sql: 'select * from Big' },
+      { signal: controller.signal, batchSize: 1 },
+    );
+    const iterator = stream[Symbol.asyncIterator]();
+
+    const pending = iterator.next();
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ code: 'operation-cancelled' });
     expect(fake.getCancelCalls()).toBe(1);
   });
 

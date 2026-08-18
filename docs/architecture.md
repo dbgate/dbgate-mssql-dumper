@@ -870,7 +870,7 @@ Every error `restoreSqlDump`/the parser throws intentionally extends
 ### `sqlcmd` directives: detected and rejected, not implemented
 
 `sqlcmd`/SSMS preprocess a script — expanding `:setvar`/`$(Variable)`
-substitutions, running `:r` file includes, executing `:!!` shell escapes —
+substitutions, running `:r` file includes, executing `!!`/`:!!` shell escapes —
 _before_ any batch ever reaches SQL Server. `restoreSqlDump` executes
 batches directly against the connection and implements no such
 preprocessor. Rather than silently forwarding an unresolved
@@ -880,7 +880,7 @@ unintended T-SQL), the parser detects these constructs explicitly and
 throws `UnsupportedSqlcmdDirectiveError`:
 
 - A colon-prefixed directive (`:r`, `:setvar`, `:connect`, `:on error`,
-  `:!!`, ...) is recognized only when the colon starts in column 1 (no
+  `:!!`, ...) or standard `!!` shell escape is recognized only when it starts in column 1 (no
   leading whitespace) — matching `sqlcmd` itself, and avoiding a false
   positive on indented T-SQL that happens to contain a colon (a `CASE`
   label, a `::` static method reference like `geography::STGeomFromText`).
@@ -1020,6 +1020,6 @@ introspection pipelines. Explicitly deferred:
 - **A `tedious`-based connection pool source.** Only direct-connection
   wrapping (`fromTediousConnection`) exists today.
 - **`sqlcmd` scripting.** `:setvar`/`$(Variable)` substitution, `:r` file
-  includes, `:connect`, and shell escapes (`:!!`) are detected and rejected
+  includes, `:connect`, and shell escapes (`!!`/`:!!`) are detected and rejected
   with `UnsupportedSqlcmdDirectiveError`, never executed or expanded (see
   "Restore" above).

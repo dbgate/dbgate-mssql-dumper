@@ -96,5 +96,5 @@ Legend: ✅ full · ⚠️ partial · ❌ not implemented · — not applicable
 
 | Suite                          | Files | Tests |
 | ------------------------------ | ----- | ----- |
-| Unit (`tests/**`)              | 24    | 329   |
+| Unit (`tests/**`)              | 24    | 341   |
 | Integration (`integration/**`) | 4     | 58    |
