@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "../dbgate-pg-dumper",
+      "../dbgate"
+    ],
+    "deny": [
+      "Edit(../dbgate-pg-dumper/**)",
+      "Write(../dbgate-pg-dumper/**)",
+      "Edit(../dbgate/**)",
+      "Write(../dbgate/**)"
+    ]
+  }
+}
