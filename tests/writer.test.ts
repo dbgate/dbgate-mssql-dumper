@@ -1,4 +1,4 @@
-import { PassThrough } from 'node:stream';
+import { PassThrough, Writable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { StreamDumpWriter, StringDumpWriter } from '../src/writer/index.js';
 
@@ -39,5 +39,49 @@ describe('StreamDumpWriter', () => {
     const writer = new StreamDumpWriter(stream);
     stream.destroy(new Error('boom'));
     await expect(writer.write('x')).rejects.toThrow('boom');
+  });
+
+  // Node emits 'drain' *before* invoking write()'s completion callback, so a
+  // writer that awaits the callback and only then subscribes to 'drain' waits
+  // for an event that has already fired. Every dump to a real file stream hung
+  // at the first chunk that exceeded the stream's highWaterMark.
+  it('resolves a write that exceeds the stream highWaterMark', async () => {
+    const stream = new Writable({
+      highWaterMark: 16,
+      write(_chunk, _encoding, callback) {
+        setTimeout(callback, 5);
+      },
+    });
+    const writer = new StreamDumpWriter(stream);
+
+    const outcome = await Promise.race([
+      writer.write('x'.repeat(64)).then(() => 'resolved'),
+      new Promise(resolve => setTimeout(() => resolve('hung'), 1000)),
+    ]);
+
+    expect(outcome).toBe('resolved');
+  });
+
+  it('keeps resolving across many backpressured writes', async () => {
+    const stream = new Writable({
+      highWaterMark: 16,
+      write(_chunk, _encoding, callback) {
+        setTimeout(callback, 1);
+      },
+    });
+    const writer = new StreamDumpWriter(stream);
+
+    const outcome = await Promise.race([
+      (async () => {
+        for (let index = 0; index < 25; index += 1) {
+          await writer.write('y'.repeat(64));
+        }
+        return 'resolved';
+      })(),
+      new Promise(resolve => setTimeout(() => resolve('hung'), 2000)),
+    ]);
+
+    expect(outcome).toBe('resolved');
+    expect(writer.bytesWritten).toBe(64 * 25);
   });
 });

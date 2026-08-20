@@ -15,6 +15,7 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 export class StreamDumpWriter implements DumpWriter {
   private readonly stream: Writable;
   private bytes = 0;
+  private writeError: Error | null = null;
 
   constructor(stream: Writable) {
     this.stream = stream;
@@ -28,41 +29,25 @@ export class StreamDumpWriter implements DumpWriter {
     if (chunk.length === 0) {
       return;
     }
+    if (this.writeError) {
+      throw this.writeError;
+    }
     throwIfAborted(signal);
 
     this.bytes += Buffer.byteLength(chunk, 'utf8');
 
-    const canWriteMore = await new Promise<boolean>((resolve, reject) => {
-      const cleanup = (): void => {
-        this.stream.removeListener('error', onError);
-        signal?.removeEventListener('abort', onAbort);
-      };
-      const onError = (error: Error): void => {
-        cleanup();
-        reject(error);
-      };
-      // Without this the promise settles only when the chunk is flushed, so
-      // aborting while the consumer is stalled would hang the whole dump
-      // forever — never resolving, never rejecting, never releasing the
-      // connection — instead of returning `cancelled: true` as documented.
-      const onAbort = (): void => {
-        cleanup();
-        reject(new DOMException('The operation was aborted.', 'AbortError'));
-      };
-      this.stream.once('error', onError);
-      signal?.addEventListener('abort', onAbort, { once: true });
-      const ok = this.stream.write(chunk, 'utf8', (error?: Error | null) => {
-        cleanup();
-        if (error) {
-          reject(error);
-        } else {
-          resolve(ok);
-        }
-      });
+    // Backpressure is gated on `write()`'s return value, with the `drain`
+    // listener attached in this same tick. Awaiting the completion callback
+    // first would be wrong: Node emits `drain` *before* running the callbacks
+    // of the writes that emptied the buffer, so subscribing afterwards waits
+    // for an event that has already fired and never fires again.
+    const canWriteMore = this.stream.write(chunk, 'utf8', (error?: Error | null) => {
+      if (error && !this.writeError) {
+        this.writeError = error;
+      }
     });
 
     if (canWriteMore === false) {
-      throwIfAborted(signal);
       await new Promise<void>((resolve, reject) => {
         const cleanup = (): void => {
           this.stream.removeListener('drain', onDrain);
@@ -89,6 +74,9 @@ export class StreamDumpWriter implements DumpWriter {
       });
     }
 
+    if (this.writeError) {
+      throw this.writeError;
+    }
     throwIfAborted(signal);
   }
 }
