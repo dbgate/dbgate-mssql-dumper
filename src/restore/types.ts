@@ -7,6 +7,13 @@ import type { SqlDumpSource } from './source.js';
 export interface RestoreOptions extends SqlBatchParserOptions {
   /** Stop at the first batch that fails execution. Defaults to `true`. */
   readonly stopOnError?: boolean;
+  /**
+   * `auto` (default) converts canonical `INSERT ... VALUES` batches produced
+   * by this package to the adapter's native bulk-load operation when
+   * available. Any batch that cannot be recognized losslessly falls back to
+   * normal SQL batch execution. `off` always uses SQL batch execution.
+   */
+  readonly bulkInsertMode?: 'auto' | 'off';
 }
 
 export interface SqlDumpRestoreRequest {

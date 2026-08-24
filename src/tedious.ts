@@ -17,6 +17,9 @@ import type { ConnectionConfiguration, RequestError } from 'tedious';
 import { Connection, Request, TYPES } from 'tedious';
 import type {
   MssqlConnection,
+  MssqlBulkColumn,
+  MssqlBulkInsertRequest,
+  MssqlBulkInsertResult,
   MssqlExecBatchResult,
   MssqlParameterValue,
   MssqlQuery,
@@ -27,6 +30,7 @@ import type {
   MssqlStreamOptions,
   MssqlTransactionStatus,
 } from './connection/types.js';
+import { quoteQualifiedIdentifier } from './security/identifiers.js';
 import { safeSqlPreview } from './restore/batches.js';
 import { MssqlDumperError, OperationCancelledError, throwIfAborted } from './utils/errors.js';
 
@@ -92,6 +96,51 @@ function resolveTediousType(parameter: MssqlQueryParameter): (typeof TYPES)[keyo
     }
   }
   return inferTediousType(parameter.value);
+}
+
+function resolveBulkType(column: MssqlBulkColumn): (typeof TYPES)[keyof typeof TYPES] {
+  const aliases: Record<string, string> = {
+    numeric: 'decimal',
+    rowversion: 'varbinary',
+    timestamp: 'varbinary',
+    sysname: 'nvarchar',
+  };
+  const requested = aliases[column.dataType.toLowerCase()] ?? column.dataType.toLowerCase();
+  const match = Object.entries(TYPES).find(([name]) => name.toLowerCase() === requested);
+  if (!match) {
+    throw new MssqlDumperError(
+      'unsupported-bulk-type',
+      `Tedious cannot bulk-load SQL Server type ${JSON.stringify(column.dataType)}`,
+    );
+  }
+  return match[1];
+}
+
+function bulkColumnOptions(column: MssqlBulkColumn): {
+  nullable: boolean;
+  length?: number;
+  precision?: number;
+  scale?: number;
+} {
+  const type = column.dataType.toLowerCase();
+  const options: {
+    nullable: boolean;
+    length?: number;
+    precision?: number;
+    scale?: number;
+  } = { nullable: column.nullable };
+  if (['char', 'varchar', 'binary', 'varbinary'].includes(type)) {
+    options.length = column.maxLength === -1 ? Infinity : column.maxLength;
+  } else if (['nchar', 'nvarchar', 'sysname'].includes(type)) {
+    options.length = column.maxLength === -1 ? Infinity : Math.max(1, column.maxLength / 2);
+  }
+  if (type === 'decimal' || type === 'numeric') {
+    options.precision = column.precision;
+    options.scale = column.scale;
+  } else if (['time', 'datetime2', 'datetimeoffset'].includes(type)) {
+    options.scale = column.scale;
+  }
+  return options;
 }
 
 function bindParameters(
@@ -283,6 +332,63 @@ export class TediousConnectionAdapter implements MssqlConnection {
         endRequest();
         signal?.removeEventListener('abort', onAbort);
         reject(isAbortSignalError(error) ? error : wrapTediousError(error as Error));
+      }
+    });
+  }
+
+  /** Sends typed rows through Tedious's native TDS bulk-load stream. */
+  async bulkInsert(
+    request: MssqlBulkInsertRequest,
+    signal?: AbortSignal,
+  ): Promise<MssqlBulkInsertResult> {
+    throwIfAborted(signal);
+    const table = quoteQualifiedIdentifier([request.schemaName, request.tableName]);
+    const endRequest = this.beginRequest(`bulkInsert(${table}, ${request.rows.length} rows)`);
+
+    return new Promise<MssqlBulkInsertResult>((resolve, reject) => {
+      let settled = false;
+      const finish = (error: Error | null | undefined, rowCount?: number): void => {
+        endRequest();
+        signal?.removeEventListener('abort', onAbort);
+        if (settled) return;
+        settled = true;
+        if (error) reject(wrapTediousError(error));
+        else resolve({ rowsAffected: rowCount ?? request.rows.length });
+      };
+
+      const bulkLoad = this.connection.newBulkLoad(
+        table,
+        {
+          // Match ordinary INSERT semantics. Generated dumps create triggers
+          // and constraints after data, but hand-authored compatible batches
+          // must not silently bypass them.
+          checkConstraints: true,
+          fireTriggers: true,
+          keepNulls: true,
+          lockTable: true,
+        },
+        finish,
+      );
+
+      const onAbort = (): void => {
+        if (!settled) {
+          settled = true;
+          reject(new OperationCancelledError());
+        }
+        bulkLoad.cancel();
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+
+      try {
+        for (const column of request.columns) {
+          bulkLoad.addColumn(column.name, resolveBulkType(column), bulkColumnOptions(column));
+        }
+        this.connection.execBulkLoad(
+          bulkLoad,
+          request.rows.map(row => Array.from(row)),
+        );
+      } catch (error) {
+        finish(error as Error);
       }
     });
   }

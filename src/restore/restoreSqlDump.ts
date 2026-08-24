@@ -5,6 +5,8 @@ import { redactSecrets, safeSqlPreview } from './batches.js';
 import { streamSqlBatches } from './batchParser.js';
 import type { ParsedSqlBatch } from './batchParser.js';
 import { RestoreExecutionError } from './errors.js';
+import { InsertBatchPreparer } from './insertBatch.js';
+import type { PreparedInsertBatchOperation } from './insertBatch.js';
 import type { RestoreBatchError, SqlDumpRestoreRequest, SqlDumpRestoreResult } from './types.js';
 
 function isAbortError(error: unknown): boolean {
@@ -32,6 +34,30 @@ async function executeBatchText(
   }
   const result = await connection.query({ sql }, signal);
   return { rowsAffected: result.rowsAffected };
+}
+
+async function executePreparedInsertBatch(
+  connection: MssqlConnection,
+  operations: readonly PreparedInsertBatchOperation[],
+  sessionState: RestoreSessionState,
+  signal?: AbortSignal,
+): Promise<{ rowsAffected: number }> {
+  let rowsAffected = 0;
+  for (const operation of operations) {
+    throwIfAborted(signal);
+    if (operation.kind === 'sql') {
+      const result = await executeBatchText(connection, operation.sql, signal);
+      rowsAffected += result.rowsAffected;
+      // Observe each session-scoped statement immediately: if a later bulk
+      // operation fails, cleanup must know that IDENTITY_INSERT is still on.
+      sessionState.observe(operation.sql);
+    } else {
+      // Prepared operations are only produced when this capability exists.
+      const result = await connection.bulkInsert!(operation.request, signal);
+      rowsAffected += result.rowsAffected;
+    }
+  }
+  return { rowsAffected };
 }
 
 /**
@@ -68,16 +94,40 @@ export async function restoreSqlDump(
   };
 
   const sessionState = new RestoreSessionState();
+  const insertBatchPreparer =
+    (request.options?.bulkInsertMode ?? 'auto') === 'auto' && acquired.connection.bulkInsert
+      ? new InsertBatchPreparer(acquired.connection)
+      : null;
 
   try {
     for await (const batch of streamSqlBatches(request.source, request.options, request.signal)) {
       report('parsing', batch);
 
+      let preparedInsertBatch: readonly PreparedInsertBatchOperation[] | null = null;
+      if (insertBatchPreparer) {
+        try {
+          preparedInsertBatch = await insertBatchPreparer.prepare(batch.sql, request.signal);
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          // Metadata lookup is an optimization prerequisite, not part of the
+          // restore itself. Permission/client limitations therefore use the
+          // same correctness-preserving fallback as an unrecognized literal.
+          preparedInsertBatch = null;
+        }
+      }
+
       for (let repetition = 0; repetition < batch.repeatCount; repetition++) {
         throwIfAborted(request.signal);
         try {
-          const result = await executeBatchText(acquired.connection, batch.sql, request.signal);
-          sessionState.observe(batch.sql);
+          const result = preparedInsertBatch
+            ? await executePreparedInsertBatch(
+                acquired.connection,
+                preparedInsertBatch,
+                sessionState,
+                request.signal,
+              )
+            : await executeBatchText(acquired.connection, batch.sql, request.signal);
+          if (!preparedInsertBatch) sessionState.observe(batch.sql);
           rowsRestored += result.rowsAffected;
           batchesExecuted++;
         } catch (error) {

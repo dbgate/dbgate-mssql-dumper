@@ -66,6 +66,30 @@ export interface MssqlStreamOptions {
   readonly batchSize?: number;
 }
 
+/** Metadata needed by an adapter to encode one column for a TDS bulk load. */
+export interface MssqlBulkColumn {
+  readonly name: string;
+  /** Base SQL Server type name, for example `int`, `nvarchar`, or `datetime2`. */
+  readonly dataType: string;
+  /** `sys.columns.max_length`; `-1` denotes a MAX large-object type. */
+  readonly maxLength: number;
+  readonly precision: number;
+  readonly scale: number;
+  readonly nullable: boolean;
+}
+
+export interface MssqlBulkInsertRequest {
+  readonly schemaName: string;
+  readonly tableName: string;
+  readonly columns: readonly MssqlBulkColumn[];
+  /** Values are in the same ordinal order as {@link columns}. */
+  readonly rows: readonly (readonly MssqlColumnValue[])[];
+}
+
+export interface MssqlBulkInsertResult {
+  readonly rowsAffected: number;
+}
+
 /**
  * Transaction state of a connection, analogous to `pg`'s
  * `PostgresTransactionStatus` but reported through
@@ -117,6 +141,16 @@ export interface MssqlConnection {
    * omit this; callers fall back to `query()`.
    */
   execBatch?(sql: string, signal?: AbortSignal): Promise<MssqlExecBatchResult>;
+
+  /**
+   * Inserts already-typed rows using the driver's native TDS bulk-load path.
+   * Optional because not every client adapter exposes bulk loading. Restore
+   * falls back to {@link execBatch} when this capability is absent.
+   */
+  bulkInsert?(
+    request: MssqlBulkInsertRequest,
+    signal?: AbortSignal,
+  ): Promise<MssqlBulkInsertResult>;
 
   /** Requests cancellation of the currently executing statement, if any. */
   cancel(): Promise<void>;

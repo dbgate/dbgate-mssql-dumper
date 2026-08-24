@@ -52,6 +52,7 @@ concept to the core API.
 | `query(query, signal?)`         | Buffered. Parameters map to `tedious.TYPES`, using an explicit `sqlType` name when given, otherwise inferred from the JS value |
 | `stream(query, options?)`       | Async-iterable rows with **true** backpressure                                                                                 |
 | `execBatch(sql, signal?)`       | Real TDS batch via `execSqlBatch` — no parameters, matching that API                                                           |
+| `bulkInsert(request, signal?)`  | Typed native TDS bulk load via `newBulkLoad` / `execBulkLoad`                                                                  |
 | `getTransactionStatus(signal?)` | Best-effort, via `@@TRANCOUNT` / `XACT_STATE()`                                                                                |
 | `cancel()`                      | `connection.cancel()`                                                                                                          |
 
@@ -66,6 +67,15 @@ difference is load-bearing for restore: `CREATE PROCEDURE`/`VIEW`/`FUNCTION`/
 inside that wrapper, and batch-scoped constructs (local temp tables, `SET`
 options intended to persist into later batches) must not be sandboxed in a
 nested execution context.
+
+### Native bulk restore
+
+`bulkInsert` uses Tedious's `newBulkLoad` / `execBulkLoad` stream. Restore calls
+it automatically for canonical generated `INSERT ... VALUES` batches. It uses
+table locking, explicit NULL preservation, constraint checking and trigger
+firing. Column definitions come from the target catalog, so `nvarchar(max)`,
+binary, numeric and high-precision date/time values are encoded with their
+target SQL Server types rather than inferred from JavaScript values.
 
 ### Streaming backpressure
 
@@ -143,4 +153,6 @@ must observe the same session.
 
 Nothing in the core package depends on `tedious`. Implement `MssqlConnection`
 over `msnodesqlv8`, `mssql`, or anything else and every API works unchanged;
-`execBatch` and `getTransactionStatus` are optional, with documented fallbacks.
+`execBatch`, `bulkInsert` and `getTransactionStatus` are optional, with
+documented fallbacks. Without `bulkInsert`, restore executes generated INSERT
+batches through the normal SQL path.

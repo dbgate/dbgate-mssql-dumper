@@ -83,7 +83,7 @@ dump does not read it into memory.
 | Function                                                               | Purpose                                                             |
 | ---------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | `dumpMssql(connection, options, output, onProgress?, signal?)`         | Full pipeline: introspect → plan → render schema → stream data      |
-| `restoreSqlDump({ connection, source, options?, signal?, progress? })` | Parse `GO`-separated batches and execute them sequentially          |
+| `restoreSqlDump({ connection, source, options?, signal?, progress? })` | Parse `GO` batches; bulk-load generated INSERTs when available      |
 | `introspectMssql(connection, options?, signal?)`                       | Normalized `MssqlDatabase` model + version/capabilities/diagnostics |
 | `inspectDumpArchive(database, options?)`                               | Pure dependency planning → ordered `ArchiveEntry[]`                 |
 | `renderPlainSql(request)`                                              | Pure model → plain T-SQL text (never touches the network)           |
