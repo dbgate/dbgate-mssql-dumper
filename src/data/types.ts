@@ -14,6 +14,12 @@ export interface TableDataExportOptions {
    * `VALUES` table-value-constructor, regardless of what is requested,
    * since exceeding it would generate a statement that fails at restore
    * time.
+   *
+   * Each statement is its own implicit transaction at restore time, so this
+   * sets how many transaction-log commits restoring the table costs — but
+   * raising it is not the win that suggests: a large `VALUES` constructor
+   * measured *slower* to restore than the commits it saves (see
+   * `insertExport.ts`). Reach for `maxRowsPerBatch` to cut restore cost.
    */
   readonly maxRowsPerStatement?: number;
   /**
@@ -24,15 +30,43 @@ export interface TableDataExportOptions {
    */
   readonly maxStatementBytes?: number;
   /**
-   * Emit a `GO` batch separator after each generated `INSERT` statement
-   * (default `true`).
+   * Maximum rows accumulated into one `GO`-terminated T-SQL batch, across
+   * however many `INSERT` statements that takes. Defaults to `10,000`.
    *
-   * Without it, a table's entire row data forms one enormous T-SQL batch:
+   * A batch is one round trip at restore time — `restoreSqlDump` executes
+   * batches strictly sequentially, so with a `GO` after every statement a
+   * large table becomes thousands of sequential round trips, and on anything
+   * but a local server that latency, not the inserting, dominates restore
+   * time. Packing statements into a batch costs nothing at restore beyond
+   * holding the batch text in memory (bounded below by
+   * `SqlBatchParserOptions.maxBatchBytes`, default 64 MiB).
+   *
+   * Set to `1` for the one-statement-per-batch shape, which gives the finest
+   * possible error attribution on restore (`RestoreBatchError` identifies a
+   * failing batch, not a statement within it) at the cost of a round trip per
+   * statement. Bookkeeping statements (`SET IDENTITY_INSERT`) never count
+   * toward the cap.
+   */
+  readonly maxRowsPerBatch?: number;
+  /**
+   * Maximum size, in UTF-8 bytes, of one `GO`-terminated batch's text — the
+   * same safety valve `maxStatementBytes` provides for a single statement,
+   * applied to the batch that contains them. Defaults to 8,000,000 bytes,
+   * comfortably under the 64 MiB a restore accepts by default. A batch always
+   * holds at least one statement, so a single statement larger than this is
+   * still emitted, alone.
+   */
+  readonly maxBatchBytes?: number;
+  /**
+   * Emit `GO` batch separators at all (default `true`).
+   *
+   * Without them, a table's entire row data forms one enormous T-SQL batch:
    * restoring it would exceed `SqlBatchParserOptions.maxBatchBytes`, require
    * the whole thing to be buffered, and hand the server a single multi-hundred
    * -megabyte batch. `SET IDENTITY_INSERT` is *session*-scoped, not
    * batch-scoped, so splitting data across batches is safe. Turn it off only
-   * when generating SQL for a consumer that has no `GO` support at all.
+   * when generating SQL for a consumer that has no `GO` support at all —
+   * `maxRowsPerBatch` and `maxBatchBytes` then have nothing to act on.
    */
   readonly emitBatchSeparators?: boolean;
 }

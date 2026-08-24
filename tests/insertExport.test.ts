@@ -527,33 +527,125 @@ describe('exportTableDataAsInserts: identifiers reaching live SQL are always quo
 });
 
 describe('exportTableDataAsInserts: batch separators', () => {
-  it('emits a GO after each INSERT statement so a large table is not one giant batch', async () => {
-    const connection = createFakeDataConnection([
-      { Id: 1, Name: 'a' },
-      { Id: 2, Name: 'b' },
-      { Id: 3, Name: 'c' },
-    ]);
+  const twoColumnTable = table({
+    pureName: 'T',
+    columns: [
+      column({ columnName: 'Id', dataType: 'int', ordinalPosition: 1 }),
+      column({ columnName: 'Name', dataType: 'nvarchar', ordinalPosition: 2 }),
+    ],
+  });
+
+  const exportRows = async (
+    rows: readonly MssqlRow[],
+    options?: Parameters<typeof exportTableDataAsInserts>[0]['options'],
+    exportTable: MssqlTable = twoColumnTable,
+  ): Promise<string> => {
     const writer = new StringDumpWriter();
-
     await exportTableDataAsInserts({
-      connection,
+      connection: createFakeDataConnection(rows),
       schemaName: 'dbo',
-      pureName: 'T',
+      pureName: exportTable.pureName,
       writer,
-      table: table({
-        pureName: 'T',
-        columns: [
-          column({ columnName: 'Id', dataType: 'int', ordinalPosition: 1 }),
-          column({ columnName: 'Name', dataType: 'nvarchar', ordinalPosition: 2 }),
-        ],
-      }),
-      options: { maxRowsPerStatement: 2 },
+      table: exportTable,
+      options,
     });
+    return writer.toString();
+  };
 
-    const text = writer.toString();
-    // Two statements (2 rows + 1 row), each followed by its own separator.
+  const rows = (count: number): MssqlRow[] =>
+    Array.from({ length: count }, (_, i) => ({ Id: i + 1, Name: `n${i}` }));
+
+  it('packs many INSERT statements into one GO batch, since every batch is a round trip on restore', async () => {
+    const text = await exportRows(rows(6), { maxRowsPerStatement: 2 });
+
+    // Three statements (2 rows each), all inside a single batch closed once at the end.
+    expect(text.match(/^INSERT INTO/gm)).toHaveLength(3);
+    expect(text.match(/^GO$/gm)).toHaveLength(1);
+    expect(text.trimEnd().endsWith('GO')).toBe(true);
+  });
+
+  it('starts a new batch once maxRowsPerBatch is reached', async () => {
+    const text = await exportRows(rows(6), { maxRowsPerStatement: 1, maxRowsPerBatch: 2 });
+
+    // Six one-row statements, batched in pairs: three batches, no trailing empty one.
+    expect(text.match(/^INSERT INTO/gm)).toHaveLength(6);
+    expect(text.match(/^GO$/gm)).toHaveLength(3);
+    // A multi-row statement spans lines, so only the statement's own first
+    // line and the separator lines are of interest here.
+    const shape = text
+      .split('\n')
+      .filter(line => line === 'GO' || line.startsWith('INSERT INTO'))
+      .map(line => (line === 'GO' ? 'GO' : 'INSERT'));
+    expect(shape).toEqual([
+      'INSERT',
+      'INSERT',
+      'GO',
+      'INSERT',
+      'INSERT',
+      'GO',
+      'INSERT',
+      'INSERT',
+      'GO',
+    ]);
+  });
+
+  it('starts a new batch once maxBatchBytes would be exceeded, independently of the row count', async () => {
+    const wide = 'x'.repeat(500);
+    const text = await exportRows(
+      Array.from({ length: 4 }, (_, i) => ({ Id: i + 1, Name: wide })),
+      { maxRowsPerStatement: 1, maxRowsPerBatch: 1000, maxBatchBytes: 700 },
+    );
+
+    // Each statement is >500 bytes, so a 700-byte batch cap admits one statement each.
+    expect(text.match(/^INSERT INTO/gm)).toHaveLength(4);
+    expect(text.match(/^GO$/gm)).toHaveLength(4);
+  });
+
+  it('keeps every emitted batch within maxBatchBytes', async () => {
+    const maxBatchBytes = 200;
+    const text = await exportRows(rows(60), { maxRowsPerStatement: 3, maxBatchBytes });
+
+    // Each `GO`-delimited segment is one batch's text, terminators included.
+    const batches = text.split('GO\n').filter(batch => batch.length > 0);
+    expect(batches.length).toBeGreaterThan(1);
+    for (const batch of batches) {
+      expect(Buffer.byteLength(batch, 'utf8')).toBeLessThanOrEqual(maxBatchBytes);
+    }
+  });
+
+  it('restores the one-statement-per-batch shape with maxRowsPerBatch: 1', async () => {
+    const text = await exportRows(rows(3), { maxRowsPerStatement: 2, maxRowsPerBatch: 1 });
+
+    expect(text.match(/^INSERT INTO/gm)).toHaveLength(2); // rows [1,2] then [3]
     expect(text.match(/^GO$/gm)).toHaveLength(2);
-    expect(text.indexOf('GO')).toBeGreaterThan(text.indexOf('INSERT INTO'));
+  });
+
+  it('closes the final batch after SET IDENTITY_INSERT OFF, exactly once', async () => {
+    const identityTable = table({
+      pureName: 'T',
+      columns: [
+        column({ columnName: 'Id', dataType: 'int', ordinalPosition: 1, isIdentity: true }),
+        column({ columnName: 'Name', dataType: 'nvarchar', ordinalPosition: 2 }),
+      ],
+    });
+    const text = await exportRows(rows(2), { maxRowsPerStatement: 1 }, identityTable);
+
+    expect(text.match(/^GO$/gm)).toHaveLength(1);
+    // The ON/OFF pair rides along in the data batch rather than forcing one of its own.
+    expect(text).toBe(
+      [
+        'SET IDENTITY_INSERT dbo.T ON;',
+        "INSERT INTO dbo.T (Id, Name) VALUES\n(1, N'n0');",
+        "INSERT INTO dbo.T (Id, Name) VALUES\n(2, N'n1');",
+        'SET IDENTITY_INSERT dbo.T OFF;',
+        'GO',
+        '',
+      ].join('\n'),
+    );
+  });
+
+  it('emits no separator at all for a table that produced no statements', async () => {
+    expect(await exportRows([])).toBe('');
   });
 
   it('omits batch separators when emitBatchSeparators is false', async () => {

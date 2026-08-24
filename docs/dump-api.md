@@ -84,19 +84,47 @@ into an error instead.
 {
   maxRowsPerStatement?: number;   // default 100, hard-clamped to 1000
   maxStatementBytes?: number;     // default 4_000_000
+  maxRowsPerBatch?: number;       // default 10_000
+  maxBatchBytes?: number;         // default 8_000_000
   streamBatchSize?: number;       // row-fetch backpressure high-water mark
   emitBatchSeparators?: boolean;  // default true
 }
 ```
 
-Rows are accumulated into multi-row `INSERT ... VALUES (…), (…);` statements,
-bounded by _both_ a row count (clamped to SQL Server's own 1000-row `VALUES`
-limit) and a rendered byte size. Only the current batch is held in memory; the
-underlying row stream is never collected into an array.
+Data is written at two nested granularities, because each one costs something
+different at restore time:
 
-`emitBatchSeparators` puts a `GO` after each statement. Leave it on: without it,
-a large table's data becomes one enormous batch that exceeds the restore
-parser's batch bound and has to be buffered whole on the way back in.
+| Unit                           | Bounded by                                 | Costs, per unit          |
+| ------------------------------ | ------------------------------------------ | ------------------------ |
+| One `INSERT … VALUES (…), (…)` | `maxRowsPerStatement`, `maxStatementBytes` | one implicit transaction |
+| One `GO`-terminated batch      | `maxRowsPerBatch`, `maxBatchBytes`         | one round trip           |
+
+Rows are accumulated into multi-row `INSERT ... VALUES (…), (…);` statements,
+and those statements are packed into `GO`-terminated batches. Each batch is one
+round trip, since `restoreSqlDump` executes batches strictly sequentially: at
+the defaults a million-row table restores as 100 round trips, against 10,000
+with a `GO` after every statement.
+
+`maxRowsPerStatement` is the one to leave alone. Larger statements commit less
+often, so they look like the cheaper unit — measured, they are not: 1000-row
+statements restored consistently slower than 100-row ones, packed or not, since
+a large `VALUES` constructor costs more to compile than the commits it saves.
+It is always clamped to SQL Server's own 1000-row `VALUES` limit regardless.
+
+Only the current statement's tuples are held in memory; the underlying row
+stream is never collected into an array, and a batch is streamed out statement
+by statement rather than assembled.
+
+`maxBatchBytes` is an exact bound on a batch's text and defaults well under the
+64 MiB `restoreSqlDump` accepts (`maxBatchBytes` there), leaving room for
+hand-editing; a single statement larger than it is still emitted, alone. Set
+`maxRowsPerBatch: 1` for one statement per batch — the finest error attribution
+a restore can report, since `RestoreBatchError` names a failing batch and not a
+statement inside it — at a round trip per statement.
+
+`emitBatchSeparators` emits the `GO` lines at all. Leave it on: without it, a
+large table's data becomes one enormous batch that exceeds the restore parser's
+batch bound and has to be buffered whole on the way back in.
 `SET IDENTITY_INSERT` is session-scoped, so splitting data across batches is
 safe.
 

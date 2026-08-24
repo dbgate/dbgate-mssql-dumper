@@ -756,17 +756,54 @@ instead of exporting a value that looks correct but is not:
 
 ### Batching
 
-Rows are accumulated into one multi-row `INSERT INTO ... (cols) VALUES
-(...), (...), ...;` statement per batch (`TableDataExportOptions.maxRowsPerStatement`,
+Data export batches at two nested levels, because a statement and a batch
+cost different things when the dump is restored.
+
+Rows are first accumulated into one multi-row `INSERT INTO ... (cols) VALUES
+(...), (...), ...;` statement (`TableDataExportOptions.maxRowsPerStatement`,
 default 100) rather than one `INSERT` per row, subject to two independent
 caps: row count, clamped to SQL Server's own hard limit of 1000 rows per
 `VALUES` table-value-constructor regardless of what is requested (exceeding
 it would produce a statement that fails at restore time), and rendered
-byte size (`maxStatementBytes`, default 4,000,000), so a batch of unusually
+byte size (`maxStatementBytes`, default 4,000,000), so a run of unusually
 wide rows cannot produce one unreasonably large statement even while under
-the row-count cap. Only the current batch's tuples are held in memory —
+the row-count cap. Only the current statement's tuples are held in memory —
 the underlying `connection.stream()` call is never collected into an array
 first.
+
+Those statements are then packed into `GO`-terminated batches
+(`maxRowsPerBatch`, default 10,000 rows; `maxBatchBytes`, default 8,000,000
+bytes of batch text), rather than one `GO` per statement. The two levels map
+onto the two costs a restore pays:
+
+- **A statement is an implicit transaction.** Its size sets how many
+  transaction-log commits the table costs — a million rows is 10,000 commits
+  at the default, a million at `maxRowsPerStatement: 1`. Counter-intuitively,
+  raising it does _not_ pay: measured against SQL Server 2022 (200k narrow
+  rows, restore timed end to end, repeated and interleaved), 1000-row
+  statements restored consistently slower than 100-row ones — packed into
+  batches or not — because a large `VALUES` table-value-constructor costs
+  more to compile and materialize than the commits it saves. Hence a default
+  well below the 1000-row ceiling.
+- **A batch is a client/server round trip.** `restoreSqlDump` executes
+  batches strictly sequentially (see "Restore" below), so batch count is a
+  latency multiplier, and on a remote server it dominates restore time. This
+  is where the savings actually were: packing statements into batches cut a
+  50k-row restore's median wall time by about a third even against a _local_
+  server (500 batches down to 5), with no change to the statements
+  themselves.
+
+Both batch caps are checked _before_ a statement is written rather than
+after, so they are genuine upper bounds and not limits a batch may overshoot
+by one statement; a batch always holds at least one statement, however large
+that single statement is on its own. `maxBatchBytes` is exact (the byte
+accounting includes the separators and terminators actually written, and is
+computed from parts already measured — never by re-scanning assembled
+statement text) and defaults to an eighth of the 64 MiB
+`SqlBatchParserOptions.maxBatchBytes` a restore accepts. `SET IDENTITY_INSERT`
+statements ride along in whatever batch is open without counting toward its
+row cap, and the final batch is closed once, after the closing `OFF` — a
+table that emitted no statements at all produces no stray `GO`.
 
 ### Identity columns and error safety
 

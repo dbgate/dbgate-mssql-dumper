@@ -14,6 +14,22 @@ import type { TableDataExportRequest, TableDataExportResult } from './types.js';
 /** SQL Server's own hard limit on rows in one `VALUES` table-value-constructor. */
 const MAX_ROWS_PER_STATEMENT_CEILING = 1000;
 
+/**
+ * Rows per `INSERT` statement by default — deliberately far below
+ * {@link MAX_ROWS_PER_STATEMENT_CEILING}.
+ *
+ * Larger statements *should* be cheaper: each statement is its own implicit
+ * transaction, so 1000-row statements commit a tenth as often as 100-row ones.
+ * Measured against SQL Server 2022 (200k narrow rows, restore timed end to
+ * end), they are not: raising this to 1000 made restores consistently slower,
+ * by roughly a third, whether or not the statements were packed into batches —
+ * a large `VALUES` table-value-constructor costs more to compile and
+ * materialize than the commits it saves. The win in this area came from
+ * `maxRowsPerBatch` instead, which cuts round trips without growing the
+ * statements. Callers whose workload disagrees can still raise it.
+ */
+const DEFAULT_MAX_ROWS_PER_STATEMENT = 100;
+
 function isAbortError(error: unknown): boolean {
   return (
     (error instanceof DOMException && error.name === 'AbortError') ||
@@ -44,25 +60,72 @@ export async function exportTableDataAsInserts(
   const tableIdent = quoteQualifiedIdentifier([schemaName, pureName]);
   const maxRowsPerStatement = Math.min(
     MAX_ROWS_PER_STATEMENT_CEILING,
-    Math.max(1, request.options?.maxRowsPerStatement ?? 100),
+    Math.max(1, request.options?.maxRowsPerStatement ?? DEFAULT_MAX_ROWS_PER_STATEMENT),
   );
   const maxStatementBytes = Math.max(1, request.options?.maxStatementBytes ?? 4_000_000);
+  const maxRowsPerBatch = Math.max(1, request.options?.maxRowsPerBatch ?? 10_000);
+  const maxBatchBytes = Math.max(1, request.options?.maxBatchBytes ?? 8_000_000);
   const streamBatchSize = request.options?.streamBatchSize;
   const emitBatchSeparators = request.options?.emitBatchSeparators ?? true;
 
   const emit = (text: string): Promise<void> => writer.write(`${text}\n`, signal);
 
+  let batchRows = 0;
+  let batchBytes = 0;
+  let batchHasContent = false;
+
   /**
-   * Closes the current T-SQL batch. Without these, a large table's data would
-   * be one single batch — unrestorable past the batch-size limit and
-   * requiring the whole thing in memory on the way back in.
-   * `SET IDENTITY_INSERT` survives a batch boundary (it is session-scoped),
-   * so this is safe between the ON and OFF statements.
+   * Closes the current T-SQL batch, if anything has been written into it.
+   *
+   * Without these separators a large table's data would be one single batch —
+   * unrestorable past the batch-size limit and requiring the whole thing in
+   * memory on the way back in. `SET IDENTITY_INSERT` survives a batch boundary
+   * (it is session-scoped), so this is safe between the ON and OFF statements.
    */
-  const emitBatchSeparator = async (): Promise<void> => {
+  const endBatch = async (): Promise<void> => {
+    if (!batchHasContent) {
+      return;
+    }
+    batchRows = 0;
+    batchBytes = 0;
+    batchHasContent = false;
     if (emitBatchSeparators) {
       await emit('GO');
     }
+  };
+
+  /**
+   * Writes one complete statement, then closes the batch once it is full.
+   *
+   * A batch holds *many* statements rather than exactly one, because every
+   * batch costs a full client/server round trip at restore time: a `GO` after
+   * each `INSERT` turns a million-row table into thousands of sequential round
+   * trips, which dominates restore time on anything but a local server.
+   *
+   * `rows` is 0 for bookkeeping statements (`SET IDENTITY_INSERT`), which ride
+   * along in whatever batch is open without counting toward its row cap.
+   * `byteLength` is the statement's exact rendered size, excluding the line
+   * terminator this function itself writes — computed by the caller from parts
+   * it has already measured, never by re-scanning the assembled statement text
+   * (which is up to `maxStatementBytes` long).
+   */
+  const emitStatement = async (sql: string, byteLength: number, rows: number): Promise<void> => {
+    // Closing *before* writing, rather than after, keeps both caps true upper
+    // bounds on what a batch contains — the same way `maxStatementBytes`
+    // bounds a statement — instead of limits a batch is allowed to overshoot
+    // by one statement. A batch always holds at least one statement, however
+    // far over the caps that single statement is on its own.
+    const writtenBytes = byteLength + 1; // the line terminator `emit` appends
+    if (
+      batchHasContent &&
+      (batchRows + rows > maxRowsPerBatch || batchBytes + writtenBytes > maxBatchBytes)
+    ) {
+      await endBatch();
+    }
+    await emit(sql);
+    batchHasContent = true;
+    batchRows += rows;
+    batchBytes += writtenBytes;
   };
 
   const orderByClause =
@@ -111,7 +174,8 @@ export async function exportTableDataAsInserts(
 
   try {
     if (hasIdentityColumn) {
-      await emit(`SET IDENTITY_INSERT ${tableIdent} ON;`);
+      const statement = `SET IDENTITY_INSERT ${tableIdent} ON;`;
+      await emitStatement(statement, Buffer.byteLength(statement, 'utf8'), 0);
       identityInsertOpened = true;
     }
 
@@ -124,30 +188,36 @@ export async function exportTableDataAsInserts(
         signal,
       );
       const rowCount = Number(countResult.rows[0]?.rowCount ?? 0);
+      // Every row renders to the identical statement, so its size is measured once.
+      const statement = `INSERT INTO ${tableIdent} DEFAULT VALUES;`;
+      const statementBytes = Buffer.byteLength(statement, 'utf8');
       for (let i = 0; i < rowCount; i++) {
         throwIfAborted(signal);
-        await emit(`INSERT INTO ${tableIdent} DEFAULT VALUES;`);
+        await emitStatement(statement, statementBytes, 1);
         rowsExported++;
-        if (rowsExported % maxRowsPerStatement === 0) {
-          await emitBatchSeparator();
-        }
         progress();
       }
     } else if (insertableColumns) {
       const columnList = insertableColumns
         .map(column => quoteIdentifier(column.columnName))
         .join(', ');
-      let batchTuples: string[] = [];
-      let batchBytes = 0;
+      const statementHeader = `INSERT INTO ${tableIdent} (${columnList}) VALUES\n`;
+      const statementHeaderBytes = Buffer.byteLength(statementHeader, 'utf8');
+      let statementTuples: string[] = [];
+      let statementBytes = 0;
 
-      const flushBatch = async (): Promise<void> => {
-        if (batchTuples.length === 0) {
+      const flushStatement = async (): Promise<void> => {
+        if (statementTuples.length === 0) {
           return;
         }
-        await emit(`INSERT INTO ${tableIdent} (${columnList}) VALUES\n${batchTuples.join(',\n')};`);
-        await emitBatchSeparator();
-        batchTuples = [];
-        batchBytes = 0;
+        const rows = statementTuples.length;
+        const sql = `${statementHeader}${statementTuples.join(',\n')};`;
+        // Exact: the header, the measured tuples, the `,\n` between each
+        // adjacent pair, and the terminating `;`.
+        const byteLength = statementHeaderBytes + statementBytes + 2 * (rows - 1) + 1;
+        statementTuples = [];
+        statementBytes = 0;
+        await emitStatement(sql, byteLength, rows);
       };
 
       for await (const row of connection.stream(
@@ -158,17 +228,18 @@ export async function exportTableDataAsInserts(
         const tuple = `(${insertableColumns.map(column => renderColumnValue(row[column.columnName] ?? null, column)).join(', ')})`;
         const tupleBytes = Buffer.byteLength(tuple, 'utf8');
         if (
-          batchTuples.length > 0 &&
-          (batchTuples.length >= maxRowsPerStatement || batchBytes + tupleBytes > maxStatementBytes)
+          statementTuples.length > 0 &&
+          (statementTuples.length >= maxRowsPerStatement ||
+            statementBytes + tupleBytes > maxStatementBytes)
         ) {
-          await flushBatch();
+          await flushStatement();
         }
-        batchTuples.push(tuple);
-        batchBytes += tupleBytes;
+        statementTuples.push(tuple);
+        statementBytes += tupleBytes;
         rowsExported++;
         progress();
       }
-      await flushBatch();
+      await flushStatement();
     } else {
       // No table model: fall back to a plain `SELECT *`, column order taken from the first row
       // (relies on `MssqlConnection` returning every selected column key on every row, per its
@@ -184,20 +255,22 @@ export async function exportTableDataAsInserts(
         }
         const values = columns.map(column => renderSqlLiteral(row[column] as SqlLiteralValue));
         const columnListText = columns.map(column => quoteIdentifier(column)).join(', ');
-        await emit(`INSERT INTO ${tableIdent} (${columnListText}) VALUES (${values.join(', ')});`);
+        const statement = `INSERT INTO ${tableIdent} (${columnListText}) VALUES (${values.join(', ')});`;
+        await emitStatement(statement, Buffer.byteLength(statement, 'utf8'), 1);
         rowsExported++;
-        if (rowsExported % maxRowsPerStatement === 0) {
-          await emitBatchSeparator();
-        }
         progress();
       }
     }
 
     if (identityInsertOpened) {
-      await emit(`SET IDENTITY_INSERT ${tableIdent} OFF;`);
+      const statement = `SET IDENTITY_INSERT ${tableIdent} OFF;`;
+      await emitStatement(statement, Buffer.byteLength(statement, 'utf8'), 0);
       identityInsertOpened = false;
-      await emitBatchSeparator();
     }
+    // Closes whatever the last statements left open. Emits nothing when the
+    // table produced no statements at all (an empty table with no identity
+    // column), so a data-only dump of empty tables stays free of stray `GO`s.
+    await endBatch();
 
     return { rowsExported, bytesWritten: writer.bytesWritten, cancelled: false, warnings };
   } catch (error) {
