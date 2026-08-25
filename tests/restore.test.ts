@@ -13,7 +13,11 @@ import type {
 
 function createBulkRestoreConnection(
   metadata: readonly MssqlRow[],
-  options?: { readonly failBulk?: boolean },
+  options?: {
+    readonly failBulk?: boolean;
+    readonly supportsNonAsciiVarchar?: boolean;
+    readonly directSqlMaxRows?: number;
+  },
 ): {
   readonly connection: MssqlConnection;
   readonly sqlBatches: string[];
@@ -24,6 +28,10 @@ function createBulkRestoreConnection(
   const bulkRequests: MssqlBulkInsertRequest[] = [];
   const metadataQueries: MssqlQuery[] = [];
   const connection: MssqlConnection = {
+    bulkInsertCapabilities: {
+      supportsNonAsciiVarchar: options?.supportsNonAsciiVarchar,
+      directSqlMaxRows: options?.directSqlMaxRows,
+    },
     async query<Row extends MssqlRow = MssqlRow>(query: MssqlQuery) {
       if (query.sql.includes('from sys.columns c')) {
         metadataQueries.push(query);
@@ -301,6 +309,7 @@ GO
       executionState?: string;
       schemaName?: string;
       tableName?: string;
+      executionReason?: string;
     }> = [];
 
     await restoreSqlDump({
@@ -319,6 +328,7 @@ GO
           executionState: event.executionState,
           schemaName: event.schemaName,
           tableName: event.tableName,
+          executionReason: event.executionReason,
         })),
     ).toEqual([
       {
@@ -326,13 +336,63 @@ GO
         executionState: 'started',
         schemaName: 'dbo',
         tableName: 'Items',
+        executionReason: 'non-ascii-varchar',
       },
       {
         executionMode: 'sql-fallback',
         executionState: 'finished',
         schemaName: 'dbo',
         tableName: 'Items',
+        executionReason: 'non-ascii-varchar',
       },
+    ]);
+  });
+
+  it('bulk-loads non-ASCII varchar data when the adapter declares it safe', async () => {
+    const bulk = createBulkRestoreConnection(
+      [
+        {
+          columnName: 'body',
+          dataType: 'varchar',
+          maxLength: 100,
+          precision: 0,
+          scale: 0,
+          isNullable: 0,
+          isIdentity: 0,
+        },
+      ],
+      { supportsNonAsciiVarchar: true },
+    );
+    const batch = "INSERT INTO dbo.Items (body) VALUES (N'北京');";
+
+    await restoreSqlDump({ connection: bulk.connection, source: `${batch}\nGO\n` });
+
+    expect(bulk.sqlBatches).toEqual([]);
+    expect(bulk.bulkRequests).toHaveLength(1);
+    expect(bulk.bulkRequests[0]!.rows).toEqual([['北京']]);
+  });
+
+  it('uses direct SQL for small batches when native staging would cost more', async () => {
+    const bulk = createBulkRestoreConnection([], { directSqlMaxRows: 500 });
+    const batch = 'INSERT INTO dbo.Items (id) VALUES (1), (2);';
+    const executions: Array<{ mode?: string; reason?: string }> = [];
+
+    await restoreSqlDump({
+      connection: bulk.connection,
+      source: `${batch}\nGO\n`,
+      progress: event => {
+        if (event.executionState) {
+          executions.push({ mode: event.executionMode, reason: event.executionReason });
+        }
+      },
+    });
+
+    expect(bulk.metadataQueries).toEqual([]);
+    expect(bulk.bulkRequests).toEqual([]);
+    expect(bulk.sqlBatches).toEqual([batch]);
+    expect(executions).toEqual([
+      { mode: 'sql-direct', reason: 'small-batch-direct-sql' },
+      { mode: 'sql-direct', reason: 'small-batch-direct-sql' },
     ]);
   });
 

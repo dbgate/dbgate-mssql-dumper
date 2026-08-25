@@ -10,7 +10,8 @@ import type { PreparedInsertBatchOperation } from './insertBatch.js';
 import type { RestoreBatchError, SqlDumpRestoreRequest, SqlDumpRestoreResult } from './types.js';
 
 interface RestoreExecutionDescriptor {
-  readonly executionMode: 'bulk-insert' | 'sql-fallback';
+  readonly executionMode: 'bulk-insert' | 'sql-direct' | 'sql-fallback';
+  readonly executionReason?: string;
   readonly schemaName: string;
   readonly tableName: string;
 }
@@ -21,6 +22,8 @@ function describePreparedInsertBatch(
   let schemaName: string | undefined;
   let tableName: string | undefined;
   let hasBulk = false;
+  let sqlExecutionMode: 'sql-direct' | 'sql-fallback' | undefined;
+  let executionReason: string | undefined;
 
   for (const operation of operations) {
     const operationSchema =
@@ -33,11 +36,16 @@ function describePreparedInsertBatch(
     schemaName = operationSchema;
     tableName = operationTable;
     if (operation.kind === 'bulk') hasBulk = true;
+    else if (operation.executionMode) {
+      sqlExecutionMode = operation.executionMode;
+      executionReason = operation.executionReason;
+    }
   }
 
   return schemaName && tableName
     ? {
-        executionMode: hasBulk ? 'bulk-insert' : 'sql-fallback',
+        executionMode: hasBulk ? 'bulk-insert' : (sqlExecutionMode ?? 'sql-fallback'),
+        ...(!hasBulk && executionReason ? { executionReason } : {}),
         schemaName,
         tableName,
       }

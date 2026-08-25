@@ -14,6 +14,24 @@ export interface PerformanceTableMetric {
   readonly durationMs: number;
   readonly batches?: number;
   readonly bytes?: number;
+  readonly reason?: string;
+}
+
+export interface NativeBulkPerformanceMetric {
+  readonly schemaName: string;
+  readonly tableName: string;
+  readonly rows: number;
+  readonly chunks: number;
+  readonly bcpRows: number;
+  readonly arrayBindRows: number;
+  readonly repairedEmptyStringRows: number;
+  readonly createStagingMs: number;
+  readonly bindStagingMs: number;
+  readonly loadStagingMs: number;
+  readonly copyToTargetMs: number;
+  readonly dropStagingMs: number;
+  readonly totalMs: number;
+  readonly succeeded: boolean;
 }
 
 export interface PerformanceReportData {
@@ -33,4 +51,5 @@ export interface PerformanceReportData {
   readonly errors?: number;
   readonly phases: readonly PerformancePhaseMetric[];
   readonly tables: readonly PerformanceTableMetric[];
+  readonly nativeBulkOperations?: readonly NativeBulkPerformanceMetric[];
 }

@@ -41,6 +41,8 @@ export type PreparedInsertBatchOperation =
       readonly sql: string;
       readonly schemaName?: string;
       readonly tableName?: string;
+      readonly executionMode?: 'sql-direct' | 'sql-fallback';
+      readonly executionReason?: string;
     }
   | { readonly kind: 'bulk'; readonly request: MssqlBulkInsertRequest };
 
@@ -282,6 +284,8 @@ const SQL_FALLBACK_CHUNK_CHARACTERS = 256 * 1024;
 
 function createSqlFallbackOperations(
   parsed: readonly ParsedOperation[],
+  executionMode: 'sql-direct' | 'sql-fallback',
+  executionReason: string,
 ): readonly PreparedInsertBatchOperation[] {
   const result: PreparedInsertBatchOperation[] = [];
   let chunk = '';
@@ -294,6 +298,8 @@ function createSqlFallbackOperations(
       sql: chunk,
       schemaName: chunkTable.schemaName,
       tableName: chunkTable.tableName,
+      executionMode,
+      executionReason,
     });
     chunk = '';
     chunkTable = null;
@@ -331,8 +337,16 @@ export class InsertBatchPreparer {
     const parsed = new CanonicalInsertParser(sql).parse();
     if (!parsed) return null;
 
-    const sqlFallback = (): readonly PreparedInsertBatchOperation[] =>
-      createSqlFallbackOperations(parsed);
+    const sqlFallback = (reason: string): readonly PreparedInsertBatchOperation[] =>
+      createSqlFallbackOperations(parsed, 'sql-fallback', reason);
+    const rowCount = parsed.reduce(
+      (sum, operation) => sum + (operation.kind === 'insert' ? operation.rows.length : 0),
+      0,
+    );
+    const directSqlMaxRows = this.connection.bulkInsertCapabilities?.directSqlMaxRows ?? 0;
+    if (rowCount > 0 && rowCount <= directSqlMaxRows) {
+      return createSqlFallbackOperations(parsed, 'sql-direct', 'small-batch-direct-sql');
+    }
 
     const prepared: PreparedInsertBatchOperation[] = [];
     for (const operation of parsed) {
@@ -347,13 +361,19 @@ export class InsertBatchPreparer {
       }
       const tableMetadata = await this.loadMetadata(operation.table, signal);
       const columns = this.matchColumns(operation.columnNames, tableMetadata);
-      if (!columns) return sqlFallback();
+      if (!columns) return sqlFallback('column-metadata-mismatch');
       const rows: MssqlColumnValue[][] = [];
       for (const parsedRow of operation.rows) {
         const row: MssqlColumnValue[] = [];
         for (let index = 0; index < columns.length; index++) {
-          const value = convertLiteral(parsedRow[index]!, columns[index]!);
-          if (value === UNSUPPORTED) return sqlFallback();
+          const literal = parsedRow[index]!;
+          const column = columns[index]!;
+          const value = convertLiteral(
+            literal,
+            column,
+            this.connection.bulkInsertCapabilities?.supportsNonAsciiVarchar ?? false,
+          );
+          if (value === UNSUPPORTED) return sqlFallback(unsupportedLiteralReason(literal, column));
           row.push(value);
         }
         rows.push(row);
@@ -434,6 +454,7 @@ const UNSUPPORTED = Symbol('unsupported');
 function convertLiteral(
   literal: ParsedLiteral,
   column: MssqlBulkColumn,
+  supportsNonAsciiVarchar: boolean,
 ): MssqlColumnValue | typeof UNSUPPORTED {
   if (literal.kind === 'null') return null;
   const type = column.dataType.toLowerCase();
@@ -442,7 +463,10 @@ function convertLiteral(
     if (literal.kind !== 'string') return UNSUPPORTED;
     // Tedious bulk-load encodes non-Unicode strings using the connection's
     // collation, which may differ from a UTF-8 collation on this column.
-    return Array.from(literal.value).every(character => character.charCodeAt(0) <= 0x7f)
+    // Native ODBC safely asks SQL Server to perform that conversion for
+    // char/varchar. Keep text conservative because its native binding differs.
+    return (supportsNonAsciiVarchar && type !== 'text') ||
+      Array.from(literal.value).every(character => character.charCodeAt(0) <= 0x7f)
       ? literal.value
       : UNSUPPORTED;
   }
@@ -493,6 +517,18 @@ function convertLiteral(
     return parseDateValue(literal.value, type);
   }
   return UNSUPPORTED;
+}
+
+function unsupportedLiteralReason(literal: ParsedLiteral, column: MssqlBulkColumn): string {
+  const type = column.dataType.toLowerCase();
+  if (
+    literal.kind === 'string' &&
+    ['char', 'varchar', 'text'].includes(type) &&
+    Array.from(literal.value).some(character => character.charCodeAt(0) > 0x7f)
+  ) {
+    return 'non-ascii-varchar';
+  }
+  return `unsupported-${type}-literal`;
 }
 
 function parseDateValue(text: string, type: string): Date | typeof UNSUPPORTED {

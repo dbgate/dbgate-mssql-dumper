@@ -92,6 +92,14 @@ export interface MssqlBulkInsertResult {
   readonly rowsAffected: number;
 }
 
+/** Adapter-specific correctness/performance properties used by the restore planner. */
+export interface MssqlBulkInsertCapabilities {
+  /** The adapter can safely send non-ASCII JavaScript strings to char/varchar columns. */
+  readonly supportsNonAsciiVarchar?: boolean;
+  /** Prefer executing the original generated SQL when a recognized batch has at most this many rows. */
+  readonly directSqlMaxRows?: number;
+}
+
 /**
  * Transaction state of a connection, analogous to `pg`'s
  * `PostgresTransactionStatus` but reported through
@@ -114,6 +122,8 @@ export type MssqlTransactionStatus = 'idle' | 'in-transaction' | 'failed' | 'unk
  * interleaved batches on a single connection.
  */
 export interface MssqlConnection {
+  readonly bulkInsertCapabilities?: MssqlBulkInsertCapabilities;
+
   query<Row extends MssqlRow = MssqlRow>(
     query: MssqlQuery,
     signal?: AbortSignal,

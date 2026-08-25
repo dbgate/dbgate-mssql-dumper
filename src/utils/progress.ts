@@ -37,7 +37,9 @@ export interface RestoreProgressEvent {
   /** Running total of rows affected across every batch executed so far; see `SqlDumpRestoreResult.rowsRestored`. */
   readonly rowsRestored?: number;
   /** Data path used by a recognized generated INSERT batch. */
-  readonly executionMode?: 'bulk-insert' | 'sql-fallback';
+  readonly executionMode?: 'bulk-insert' | 'sql-direct' | 'sql-fallback';
+  /** Why this execution path was selected, without including SQL or row values. */
+  readonly executionReason?: string;
   /** Lifecycle of the current execution attempt. */
   readonly executionState?: 'started' | 'finished' | 'failed';
   readonly schemaName?: string;
