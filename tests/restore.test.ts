@@ -296,10 +296,44 @@ GO
     ]);
     const batch = "INSERT INTO dbo.Items (body) VALUES (N'北京');";
 
-    await restoreSqlDump({ connection: bulk.connection, source: `${batch}\nGO\n` });
+    const progress: Array<{
+      executionMode?: string;
+      executionState?: string;
+      schemaName?: string;
+      tableName?: string;
+    }> = [];
+
+    await restoreSqlDump({
+      connection: bulk.connection,
+      source: `${batch}\nGO\n`,
+      progress: event => progress.push(event),
+    });
 
     expect(bulk.bulkRequests).toEqual([]);
     expect(bulk.sqlBatches).toEqual([batch]);
+    expect(
+      progress
+        .filter(event => event.executionState)
+        .map(event => ({
+          executionMode: event.executionMode,
+          executionState: event.executionState,
+          schemaName: event.schemaName,
+          tableName: event.tableName,
+        })),
+    ).toEqual([
+      {
+        executionMode: 'sql-fallback',
+        executionState: 'started',
+        schemaName: 'dbo',
+        tableName: 'Items',
+      },
+      {
+        executionMode: 'sql-fallback',
+        executionState: 'finished',
+        schemaName: 'dbo',
+        tableName: 'Items',
+      },
+    ]);
   });
 
   it('splits a large canonical SQL fallback into bounded requests before executing it', async () => {

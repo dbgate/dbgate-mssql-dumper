@@ -989,9 +989,12 @@ guard over connection _options_, as opposed to SQL _text_).
 ### Progress and cancellation
 
 `progress` receives `parsing` events (one per batch as it is parsed, with
-`batchIndex`) interleaved with `executing` events (one per batch execution,
+`batchIndex`) interleaved with `executing` events around each batch execution,
 including each repetition of a `GO <n>` batch, with a running
-`rowsRestored` total) and a final `finalizing` event. `AbortSignal` is
+`rowsRestored` total. Recognized generated INSERT batches additionally report
+their `executionMode` (`bulk-insert` or `sql-fallback`), lifecycle state, schema,
+and table so callers can aggregate concise table-level start/finish messages.
+A final `finalizing` event closes the stream. `AbortSignal` is
 checked before every batch execution and at every chunk boundary while
 reading `source`; on cancellation, `restoreSqlDump` returns
 `{ cancelled: true, ... }` with whatever had already executed, and the

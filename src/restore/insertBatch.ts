@@ -36,7 +36,12 @@ interface ParsedSqlOperation {
 type ParsedOperation = ParsedInsert | ParsedSqlOperation;
 
 export type PreparedInsertBatchOperation =
-  | { readonly kind: 'sql'; readonly sql: string }
+  | {
+      readonly kind: 'sql';
+      readonly sql: string;
+      readonly schemaName?: string;
+      readonly tableName?: string;
+    }
   | { readonly kind: 'bulk'; readonly request: MssqlBulkInsertRequest };
 
 const NUMBER_PATTERN = /[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/y;
@@ -280,18 +285,36 @@ function createSqlFallbackOperations(
 ): readonly PreparedInsertBatchOperation[] {
   const result: PreparedInsertBatchOperation[] = [];
   let chunk = '';
+  let chunkTable: TableReference | null = null;
+
+  const flush = (): void => {
+    if (!chunk || !chunkTable) return;
+    result.push({
+      kind: 'sql',
+      sql: chunk,
+      schemaName: chunkTable.schemaName,
+      tableName: chunkTable.tableName,
+    });
+    chunk = '';
+    chunkTable = null;
+  };
 
   for (const operation of parsed) {
     const statement = operation.sql;
     const candidate = chunk ? `${chunk}\n${statement}` : statement;
-    if (chunk && candidate.length > SQL_FALLBACK_CHUNK_CHARACTERS) {
-      result.push({ kind: 'sql', sql: chunk });
+    const sameTable =
+      chunkTable?.schemaName === operation.table.schemaName &&
+      chunkTable.tableName === operation.table.tableName;
+    if (chunk && (!sameTable || candidate.length > SQL_FALLBACK_CHUNK_CHARACTERS)) {
+      flush();
       chunk = statement;
+      chunkTable = operation.table;
     } else {
       chunk = candidate;
+      chunkTable = operation.table;
     }
   }
-  if (chunk) result.push({ kind: 'sql', sql: chunk });
+  flush();
   return result;
 }
 
@@ -314,7 +337,12 @@ export class InsertBatchPreparer {
     const prepared: PreparedInsertBatchOperation[] = [];
     for (const operation of parsed) {
       if (operation.kind === 'sql') {
-        prepared.push({ kind: 'sql', sql: operation.sql });
+        prepared.push({
+          kind: 'sql',
+          sql: operation.sql,
+          schemaName: operation.table.schemaName,
+          tableName: operation.table.tableName,
+        });
         continue;
       }
       const tableMetadata = await this.loadMetadata(operation.table, signal);

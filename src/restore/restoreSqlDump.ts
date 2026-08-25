@@ -9,6 +9,41 @@ import { InsertBatchPreparer } from './insertBatch.js';
 import type { PreparedInsertBatchOperation } from './insertBatch.js';
 import type { RestoreBatchError, SqlDumpRestoreRequest, SqlDumpRestoreResult } from './types.js';
 
+interface RestoreExecutionDescriptor {
+  readonly executionMode: 'bulk-insert' | 'sql-fallback';
+  readonly schemaName: string;
+  readonly tableName: string;
+}
+
+function describePreparedInsertBatch(
+  operations: readonly PreparedInsertBatchOperation[],
+): RestoreExecutionDescriptor | undefined {
+  let schemaName: string | undefined;
+  let tableName: string | undefined;
+  let hasBulk = false;
+
+  for (const operation of operations) {
+    const operationSchema =
+      operation.kind === 'bulk' ? operation.request.schemaName : operation.schemaName;
+    const operationTable =
+      operation.kind === 'bulk' ? operation.request.tableName : operation.tableName;
+    if (!operationSchema || !operationTable) return undefined;
+    if (schemaName && (schemaName !== operationSchema || tableName !== operationTable))
+      return undefined;
+    schemaName = operationSchema;
+    tableName = operationTable;
+    if (operation.kind === 'bulk') hasBulk = true;
+  }
+
+  return schemaName && tableName
+    ? {
+        executionMode: hasBulk ? 'bulk-insert' : 'sql-fallback',
+        schemaName,
+        tableName,
+      }
+    : undefined;
+}
+
 function isAbortError(error: unknown): boolean {
   return (
     (error instanceof DOMException && error.name === 'AbortError') ||
@@ -84,12 +119,19 @@ export async function restoreSqlDump(
   let rowsRestored = 0;
   const errors: RestoreBatchError[] = [];
 
-  const report = (phase: 'parsing' | 'executing' | 'finalizing', batch?: ParsedSqlBatch): void => {
+  const report = (
+    phase: 'parsing' | 'executing' | 'finalizing',
+    batch?: ParsedSqlBatch,
+    descriptor?: RestoreExecutionDescriptor,
+    executionState?: 'started' | 'finished' | 'failed',
+  ): void => {
     request.progress?.({
       phase,
       batchIndex: batch?.batchIndex,
       statementsProcessed: batchesExecuted + batchesFailed,
       rowsRestored,
+      ...descriptor,
+      executionState,
     });
   };
 
@@ -116,8 +158,13 @@ export async function restoreSqlDump(
         }
       }
 
+      const executionDescriptor = preparedInsertBatch
+        ? describePreparedInsertBatch(preparedInsertBatch)
+        : undefined;
+
       for (let repetition = 0; repetition < batch.repeatCount; repetition++) {
         throwIfAborted(request.signal);
+        report('executing', batch, executionDescriptor, 'started');
         try {
           const result = preparedInsertBatch
             ? await executePreparedInsertBatch(
@@ -130,11 +177,13 @@ export async function restoreSqlDump(
           if (!preparedInsertBatch) sessionState.observe(batch.sql);
           rowsRestored += result.rowsAffected;
           batchesExecuted++;
+          report('executing', batch, executionDescriptor, 'finished');
         } catch (error) {
           if (isAbortError(error)) {
             throw error;
           }
           batchesFailed++;
+          report('executing', batch, executionDescriptor, 'failed');
           const executionError = new RestoreExecutionError(
             batch.batchIndex,
             batch.location,
@@ -153,7 +202,6 @@ export async function restoreSqlDump(
             return { batchesExecuted, batchesFailed, rowsRestored, errors, cancelled: false };
           }
         }
-        report('executing', batch);
       }
     }
 

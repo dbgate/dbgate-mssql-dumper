@@ -30,6 +30,12 @@ export interface RestoreProgressEvent {
   readonly batchIndex?: number;
   /** Running total of rows affected across every batch executed so far; see `SqlDumpRestoreResult.rowsRestored`. */
   readonly rowsRestored?: number;
+  /** Data path used by a recognized generated INSERT batch. */
+  readonly executionMode?: 'bulk-insert' | 'sql-fallback';
+  /** Lifecycle of the current execution attempt. */
+  readonly executionState?: 'started' | 'finished' | 'failed';
+  readonly schemaName?: string;
+  readonly tableName?: string;
 }
 
 export type RestoreProgressCallback = (event: RestoreProgressEvent) => void;
