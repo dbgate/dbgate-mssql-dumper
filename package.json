@@ -1,6 +1,6 @@
 {
   "name": "dbgate-mssql-dumper",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Standalone, client-agnostic Microsoft SQL Server SQL dump and restore library for Node.js",
   "type": "module",
   "license": "GPL-3.0-only",
