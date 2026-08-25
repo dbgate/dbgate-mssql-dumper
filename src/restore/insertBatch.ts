@@ -394,6 +394,7 @@ export class InsertBatchPreparer {
         precision: Number(column.precision),
         scale: Number(column.scale),
         nullable: Boolean(column.isNullable),
+        ...(column.isIdentity ? { identity: true } : {}),
       });
     }
     return result;

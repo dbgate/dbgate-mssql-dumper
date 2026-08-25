@@ -76,6 +76,8 @@ export interface MssqlBulkColumn {
   readonly precision: number;
   readonly scale: number;
   readonly nullable: boolean;
+  /** Whether the target column is an IDENTITY column. */
+  readonly identity?: boolean;
 }
 
 export interface MssqlBulkInsertRequest {

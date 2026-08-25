@@ -1,5 +1,6 @@
 import type { Connection, Request } from 'tedious';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import type { MssqlBulkInsertRequest } from '../src/connection/types.js';
 import { TediousConnectionAdapter } from '../src/tedious.js';
 
 interface FakeTediousRowColumn {
@@ -46,6 +47,16 @@ function createFakeTediousConnection() {
   let cancelCalls = 0;
   let closeCalls = 0;
   let completeOnCancel = true;
+  let currentBulkLoad:
+    | {
+        table: string;
+        callback: (error?: Error | null, rowCount?: number) => void;
+        columns: string[];
+        addColumn: (name: string) => void;
+        cancel: () => void;
+      }
+    | undefined;
+  let currentBulkRows: unknown[][] | undefined;
   /** When set, exec* throws synchronously, as tedious does for a wrong-state request. */
   let execThrows: Error | null = null;
 
@@ -59,6 +70,26 @@ function createFakeTediousConnection() {
       if (execThrows) throw execThrows;
       currentRequest = request;
       lastExecKind = 'execSqlBatch';
+    },
+    newBulkLoad(
+      table: string,
+      _options: unknown,
+      callback: (error?: Error | null, rowCount?: number) => void,
+    ) {
+      const columns: string[] = [];
+      currentBulkLoad = {
+        table,
+        callback,
+        columns,
+        addColumn(name: string) {
+          columns.push(name);
+        },
+        cancel() {},
+      };
+      return currentBulkLoad;
+    },
+    execBulkLoad(_bulkLoad: unknown, rows: unknown[][]) {
+      currentBulkRows = rows;
     },
     cancel() {
       cancelCalls++;
@@ -87,6 +118,10 @@ function createFakeTediousConnection() {
     },
     getCancelCalls: () => cancelCalls,
     getCloseCalls: () => closeCalls,
+    getCurrentBulkLoad: () => currentBulkLoad,
+    getCurrentBulkRows: () => currentBulkRows,
+    completeBulk: (error?: Error | null, rowCount?: number) =>
+      currentBulkLoad?.callback(error, rowCount),
   };
 }
 
@@ -259,6 +294,72 @@ describe('TediousConnectionAdapter.execBatch', () => {
     expect((queryRequest as unknown as { timeout: number }).timeout).toBe(1234);
     completeRequest(queryRequest, null, 1);
     await queryPromise;
+  });
+});
+
+describe('TediousConnectionAdapter.bulkInsert', () => {
+  it('stages identity rows before copying them with ordinary INSERT semantics', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+    const request: MssqlBulkInsertRequest = {
+      schemaName: 'dbo',
+      tableName: 'Items',
+      columns: [
+        {
+          name: 'id',
+          dataType: 'int',
+          maxLength: 4,
+          precision: 10,
+          scale: 0,
+          nullable: false,
+          identity: true,
+        },
+        {
+          name: 'body',
+          dataType: 'nvarchar',
+          maxLength: 100,
+          precision: 0,
+          scale: 0,
+          nullable: true,
+        },
+      ],
+      rows: [
+        [41, 'first'],
+        [99, 'second'],
+      ],
+    };
+
+    const promise = adapter.bulkInsert(request);
+    const createRequest = fake.getCurrentRequest()!;
+    expect((createRequest as unknown as { sqlTextOrProcedure: string }).sqlTextOrProcedure).toMatch(
+      /SELECT TOP \(0\).*INTO \[#__dbgate_restore_/s,
+    );
+    completeRequest(createRequest, null, 0);
+    await vi.waitFor(() => expect(fake.getCurrentBulkLoad()).toBeDefined());
+
+    expect(fake.getCurrentBulkLoad()?.table).toMatch(/^\[#__dbgate_restore_/);
+    expect(fake.getCurrentBulkLoad()?.columns).toEqual(['id', 'body']);
+    expect(fake.getCurrentBulkRows()).toEqual([
+      [41, 'first'],
+      [99, 'second'],
+    ]);
+    fake.completeBulk(null, 2);
+    await vi.waitFor(() => expect(fake.getCurrentRequest()).not.toBe(createRequest));
+
+    const copyRequest = fake.getCurrentRequest()!;
+    expect((copyRequest as unknown as { sqlTextOrProcedure: string }).sqlTextOrProcedure).toMatch(
+      /^INSERT INTO dbo\.Items.*SELECT.*FROM \[#__dbgate_restore_/s,
+    );
+    completeRequest(copyRequest, null, 2);
+    await vi.waitFor(() => expect(fake.getCurrentRequest()).not.toBe(copyRequest));
+
+    const dropRequest = fake.getCurrentRequest()!;
+    expect((dropRequest as unknown as { sqlTextOrProcedure: string }).sqlTextOrProcedure).toMatch(
+      /^DROP TABLE IF EXISTS \[#__dbgate_restore_/,
+    );
+    completeRequest(dropRequest, null, 0);
+
+    await expect(promise).resolves.toEqual({ rowsAffected: 2 });
   });
 });
 

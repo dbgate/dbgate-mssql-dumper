@@ -192,6 +192,7 @@ GO
     ]);
     expect(bulk.bulkRequests).toHaveLength(1);
     expect(bulk.bulkRequests[0]!.rows[0]![0]).toBe(1);
+    expect(bulk.bulkRequests[0]!.columns[0]!.identity).toBe(true);
     expect(bulk.bulkRequests[0]!.rows[0]![1]).toBe("hello 'world\nGO\nok");
     expect(bulk.bulkRequests[0]!.rows[0]![2]).toEqual(Buffer.from([0, 255]));
     expect(bulk.bulkRequests[0]!.rows[0]![3]).toBeInstanceOf(Date);

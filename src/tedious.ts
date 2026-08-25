@@ -36,6 +36,7 @@ import { MssqlDumperError, OperationCancelledError, throwIfAborted } from './uti
 
 /** Rows buffered ahead of the consumer before `stream()` pauses the underlying request. */
 const DEFAULT_STREAM_HIGH_WATER_MARK = 50;
+let stagingTableCounter = 0;
 
 interface TediousColumnMetadata {
   readonly colName: string;
@@ -369,6 +370,50 @@ export class TediousConnectionAdapter implements MssqlConnection {
   ): Promise<MssqlBulkInsertResult> {
     throwIfAborted(signal);
     const table = quoteQualifiedIdentifier([request.schemaName, request.tableName]);
+
+    // Tedious's INSERT BULK API does not expose SQL Server's KEEPIDENTITY
+    // option. Bulk-loading directly into an identity table therefore lets
+    // SQL Server generate new values, regardless of the dump's surrounding
+    // SET IDENTITY_INSERT. Load those requests into a non-identity temp heap
+    // first, then use an ordinary INSERT ... SELECT on this same session;
+    // that statement honors IDENTITY_INSERT and preserves the dumped keys.
+    if (request.columns.some(column => column.identity)) {
+      const staging = quoteQualifiedIdentifier([
+        `#__dbgate_restore_${process.pid}_${Date.now()}_${stagingTableCounter++}`,
+      ]);
+      const columns = request.columns
+        .map(column => quoteQualifiedIdentifier([column.name]))
+        .join(', ');
+      let stagingCreated = false;
+      try {
+        await this.execBatch(
+          `SELECT TOP (0) ${columns} INTO ${staging} FROM ${table}\nUNION ALL\nSELECT TOP (0) ${columns} FROM ${table};`,
+          signal,
+        );
+        stagingCreated = true;
+        await this.executeBulkInsert(staging, request, signal);
+        await this.execBatch(
+          `INSERT INTO ${table} (${columns}) SELECT ${columns} FROM ${staging};`,
+          signal,
+        );
+        return { rowsAffected: request.rows.length };
+      } finally {
+        if (stagingCreated) {
+          // Cleanup must still run after cancellation and must not replace the
+          // original restore error if the connection is already unusable.
+          await this.execBatch(`DROP TABLE IF EXISTS ${staging};`).catch(() => {});
+        }
+      }
+    }
+
+    return this.executeBulkInsert(table, request, signal);
+  }
+
+  private async executeBulkInsert(
+    table: string,
+    request: MssqlBulkInsertRequest,
+    signal?: AbortSignal,
+  ): Promise<MssqlBulkInsertResult> {
     const endRequest = this.beginRequest(`bulkInsert(${table}, ${request.rows.length} rows)`);
 
     return new Promise<MssqlBulkInsertResult>((resolve, reject) => {
