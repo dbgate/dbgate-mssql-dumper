@@ -19,7 +19,6 @@ interface TableReference {
 
 interface ParsedInsert {
   readonly kind: 'insert';
-  readonly sql: string;
   readonly table: TableReference;
   readonly columnNames: readonly string[];
   readonly rows: readonly (readonly ParsedLiteral[])[];
@@ -77,13 +76,7 @@ class CanonicalInsertParser {
         }
         const rows = this.parseRows(columnNames.length);
         if (!rows) return null;
-        operations.push({
-          kind: 'insert',
-          sql: this.sql.slice(start, this.position).trim(),
-          table,
-          columnNames,
-          rows,
-        });
+        operations.push({ kind: 'insert', table, columnNames, rows });
         inserts++;
       } else {
         return null;
@@ -290,31 +283,16 @@ export class InsertBatchPreparer {
       }
       const tableMetadata = await this.loadMetadata(operation.table, signal);
       const columns = this.matchColumns(operation.columnNames, tableMetadata);
-      if (!columns) {
-        prepared.push({ kind: 'sql', sql: operation.sql });
-        continue;
-      }
+      if (!columns) return null;
       const rows: MssqlColumnValue[][] = [];
-      let supported = true;
       for (const parsedRow of operation.rows) {
         const row: MssqlColumnValue[] = [];
         for (let index = 0; index < columns.length; index++) {
           const value = convertLiteral(parsedRow[index]!, columns[index]!);
-          if (value === UNSUPPORTED) {
-            supported = false;
-            break;
-          }
+          if (value === UNSUPPORTED) return null;
           row.push(value);
         }
-        if (!supported) break;
         rows.push(row);
-      }
-      if (!supported) {
-        // Keep the optimization local: one unsupported value only falls back
-        // its original INSERT statement, while surrounding canonical INSERTs
-        // in the same GO batch can still use native bulk loading.
-        prepared.push({ kind: 'sql', sql: operation.sql });
-        continue;
       }
 
       const previous = prepared[prepared.length - 1];
