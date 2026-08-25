@@ -14,6 +14,12 @@ export interface DumpProgressEvent {
   readonly objectsTotal?: number;
   /** Bytes written to the output so far, when practical to report (e.g. during `exporting-data`). */
   readonly bytesWritten?: number;
+  /** Lifecycle of a table data export. */
+  readonly exportState?: 'started' | 'progress' | 'finished' | 'failed' | 'cancelled';
+  readonly schemaName?: string;
+  readonly tableName?: string;
+  /** Rows exported from the current table. */
+  readonly rowsExported?: number;
 }
 
 export type DumpProgressCallback = (event: DumpProgressEvent) => void;

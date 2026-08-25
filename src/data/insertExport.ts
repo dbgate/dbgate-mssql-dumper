@@ -158,21 +158,28 @@ export async function exportTableDataAsInserts(
   // identity column ... when IDENTITY_INSERT is set to OFF". One cheap
   // catalog probe (fully parameterized) keeps the fallback path correct
   // rather than silently emitting an unrestorable dump.
-  const hasIdentityColumn = insertableColumns
-    ? insertableColumns.some(column => column.isIdentity)
-    : await tableHasIdentityColumn(request);
   let identityInsertOpened = false;
 
-  const progress = (): void => {
+  const progress = (
+    exportState: 'started' | 'progress' | 'finished' | 'failed' | 'cancelled',
+  ): void => {
     onProgress?.({
       phase: 'exporting-data',
       message: `${schemaName}.${pureName}`,
       objectsProcessed: rowsExported,
       bytesWritten: writer.bytesWritten,
+      exportState,
+      schemaName,
+      tableName: pureName,
+      rowsExported,
     });
   };
 
+  progress('started');
   try {
+    const hasIdentityColumn = insertableColumns
+      ? insertableColumns.some(column => column.isIdentity)
+      : await tableHasIdentityColumn(request);
     if (hasIdentityColumn) {
       const statement = `SET IDENTITY_INSERT ${tableIdent} ON;`;
       await emitStatement(statement, Buffer.byteLength(statement, 'utf8'), 0);
@@ -195,7 +202,7 @@ export async function exportTableDataAsInserts(
         throwIfAborted(signal);
         await emitStatement(statement, statementBytes, 1);
         rowsExported++;
-        progress();
+        progress('progress');
       }
     } else if (insertableColumns) {
       const columnList = insertableColumns
@@ -237,7 +244,7 @@ export async function exportTableDataAsInserts(
         statementTuples.push(tuple);
         statementBytes += tupleBytes;
         rowsExported++;
-        progress();
+        progress('progress');
       }
       await flushStatement();
     } else {
@@ -258,7 +265,7 @@ export async function exportTableDataAsInserts(
         const statement = `INSERT INTO ${tableIdent} (${columnListText}) VALUES (${values.join(', ')});`;
         await emitStatement(statement, Buffer.byteLength(statement, 'utf8'), 1);
         rowsExported++;
-        progress();
+        progress('progress');
       }
     }
 
@@ -272,6 +279,7 @@ export async function exportTableDataAsInserts(
     // column), so a data-only dump of empty tables stays free of stray `GO`s.
     await endBatch();
 
+    progress('finished');
     return { rowsExported, bytesWritten: writer.bytesWritten, cancelled: false, warnings };
   } catch (error) {
     if (identityInsertOpened) {
@@ -291,8 +299,10 @@ export async function exportTableDataAsInserts(
       }
     }
     if (isAbortError(error)) {
+      progress('cancelled');
       return { rowsExported, bytesWritten: writer.bytesWritten, cancelled: true, warnings };
     }
+    progress('failed');
     throw error;
   }
 }

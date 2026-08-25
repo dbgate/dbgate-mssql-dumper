@@ -80,6 +80,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.25.1",
+    "@toon-format/toon": "^4.1.1",
     "@types/node": "^22.15.3",
     "eslint": "^9.25.1",
     "prettier": "^3.5.3",

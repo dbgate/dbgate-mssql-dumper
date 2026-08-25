@@ -11,5 +11,6 @@ export default defineConfig({
   clean: true,
   target: 'node20',
   skipNodeModulesBundle: true,
+  noExternal: ['@toon-format/toon'],
   splitting: false,
 });

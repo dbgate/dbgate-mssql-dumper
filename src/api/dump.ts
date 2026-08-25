@@ -32,6 +32,7 @@ export async function dumpMssql(
   const acquired = await acquireMssqlConnection(connectionInput, signal);
 
   try {
+    onProgress?.({ phase: 'introspecting' });
     const introspection = await introspectMssql(
       acquired.connection,
       { selection: options.selection },

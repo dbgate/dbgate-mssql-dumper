@@ -205,7 +205,11 @@ describe('dumpMssql end-to-end', () => {
     const rowCounts: number[] = [];
 
     await dumpMssql(connection, { mode: 'full' }, stream, event => {
-      if (event.phase === 'exporting-data' && typeof event.objectsProcessed === 'number') {
+      if (
+        event.phase === 'exporting-data' &&
+        event.exportState === 'progress' &&
+        typeof event.objectsProcessed === 'number'
+      ) {
         rowCounts.push(event.objectsProcessed);
       }
     });

@@ -13,3 +13,4 @@ export * from './preflight/index.js';
 export * from './restore/index.js';
 export * from './utils/index.js';
 export * from './api/index.js';
+export * from './performance/index.js';
