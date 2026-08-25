@@ -208,6 +208,25 @@ describe('TediousConnectionAdapter.execBatch', () => {
     await expect(promise).rejects.toThrow("Incorrect syntax near 'this'.");
   });
 
+  it('preserves SQL Server messages from Tedious AggregateError failures', async () => {
+    const fake = createFakeTediousConnection();
+    const adapter = new TediousConnectionAdapter(fake.connection);
+
+    const promise = adapter.execBatch('INSERT INTO dbo.Items VALUES (...);');
+    const request = fake.getCurrentRequest()!;
+    completeRequest(
+      request,
+      new AggregateError([
+        new Error('String or binary data would be truncated.'),
+        new Error('The statement has been terminated.'),
+      ]),
+    );
+
+    await expect(promise).rejects.toThrow(
+      'String or binary data would be truncated.; The statement has been terminated.',
+    );
+  });
+
   it('cancels the connection and rejects when the signal is aborted', async () => {
     const fake = createFakeTediousConnection();
     const adapter = new TediousConnectionAdapter(fake.connection);

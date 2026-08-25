@@ -58,8 +58,34 @@ function toList<T>(value: unknown): readonly T[] {
   return Object.values(value as Record<string, T>);
 }
 
+function describeTediousError(error: unknown): string {
+  // Tedious replaces multiple SQL Server errors with an AggregateError whose
+  // own message is empty. The useful RequestError messages remain in
+  // AggregateError.errors, so flatten them instead of showing a blank restore
+  // error (common when one INSERT batch reports several conversion failures).
+  if (error instanceof AggregateError) {
+    const messages = Array.from(error.errors, describeTediousError).filter(Boolean);
+    if (messages.length > 0) return [...new Set(messages)].join('; ');
+  }
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+
+  if (error && typeof error === 'object') {
+    const candidate = error as { message?: unknown; code?: unknown };
+    if (typeof candidate.message === 'string' && candidate.message.trim()) {
+      return candidate.message.trim();
+    }
+    if (typeof candidate.code === 'string' && candidate.code.trim()) {
+      return `Tedious request failed (${candidate.code})`;
+    }
+  }
+  const text = String(error).trim();
+  return text && text !== '[object Object]' ? text : 'Tedious request failed';
+}
+
 function wrapTediousError(error: RequestError | Error): MssqlDumperError {
-  return new MssqlDumperError('tedious-request-failed', error.message, { cause: error });
+  return new MssqlDumperError('tedious-request-failed', describeTediousError(error), {
+    cause: error,
+  });
 }
 
 function isAbortSignalError(error: unknown): boolean {

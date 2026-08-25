@@ -19,6 +19,8 @@ interface TableReference {
 
 interface ParsedInsert {
   readonly kind: 'insert';
+  /** Exact source statement, retained for a correctness-preserving SQL fallback. */
+  readonly sql: string;
   readonly table: TableReference;
   readonly columnNames: readonly string[];
   readonly rows: readonly (readonly ParsedLiteral[])[];
@@ -76,7 +78,13 @@ class CanonicalInsertParser {
         }
         const rows = this.parseRows(columnNames.length);
         if (!rows) return null;
-        operations.push({ kind: 'insert', table, columnNames, rows });
+        operations.push({
+          kind: 'insert',
+          sql: this.sql.slice(start, this.position).trim(),
+          table,
+          columnNames,
+          rows,
+        });
         inserts++;
       } else {
         return null;
@@ -262,6 +270,31 @@ from sys.columns c
 where c.object_id = object_id(quotename(@schemaName) + N'.' + quotename(@tableName))
 order by c.column_id`;
 
+// Tedious sends execSqlBatch text as UTF-16 over TDS. Keep fallback requests
+// comfortably below the multi-megabyte GO batches produced by the dumper,
+// while preserving each original INSERT statement as an atomic unit.
+const SQL_FALLBACK_CHUNK_CHARACTERS = 256 * 1024;
+
+function createSqlFallbackOperations(
+  parsed: readonly ParsedOperation[],
+): readonly PreparedInsertBatchOperation[] {
+  const result: PreparedInsertBatchOperation[] = [];
+  let chunk = '';
+
+  for (const operation of parsed) {
+    const statement = operation.sql;
+    const candidate = chunk ? `${chunk}\n${statement}` : statement;
+    if (chunk && candidate.length > SQL_FALLBACK_CHUNK_CHARACTERS) {
+      result.push({ kind: 'sql', sql: chunk });
+      chunk = statement;
+    } else {
+      chunk = candidate;
+    }
+  }
+  if (chunk) result.push({ kind: 'sql', sql: chunk });
+  return result;
+}
+
 export class InsertBatchPreparer {
   private readonly metadata = new Map<string, Promise<readonly MetadataRow[]>>();
 
@@ -275,6 +308,9 @@ export class InsertBatchPreparer {
     const parsed = new CanonicalInsertParser(sql).parse();
     if (!parsed) return null;
 
+    const sqlFallback = (): readonly PreparedInsertBatchOperation[] =>
+      createSqlFallbackOperations(parsed);
+
     const prepared: PreparedInsertBatchOperation[] = [];
     for (const operation of parsed) {
       if (operation.kind === 'sql') {
@@ -283,13 +319,13 @@ export class InsertBatchPreparer {
       }
       const tableMetadata = await this.loadMetadata(operation.table, signal);
       const columns = this.matchColumns(operation.columnNames, tableMetadata);
-      if (!columns) return null;
+      if (!columns) return sqlFallback();
       const rows: MssqlColumnValue[][] = [];
       for (const parsedRow of operation.rows) {
         const row: MssqlColumnValue[] = [];
         for (let index = 0; index < columns.length; index++) {
           const value = convertLiteral(parsedRow[index]!, columns[index]!);
-          if (value === UNSUPPORTED) return null;
+          if (value === UNSUPPORTED) return sqlFallback();
           row.push(value);
         }
         rows.push(row);

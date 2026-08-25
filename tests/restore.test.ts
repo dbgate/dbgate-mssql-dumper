@@ -301,6 +301,31 @@ GO
     expect(bulk.sqlBatches).toEqual([batch]);
   });
 
+  it('splits a large canonical SQL fallback into bounded requests before executing it', async () => {
+    const bulk = createBulkRestoreConnection([
+      {
+        columnName: 'body',
+        dataType: 'varchar',
+        maxLength: -1,
+        precision: 0,
+        scale: 0,
+        isNullable: 0,
+        isIdentity: 0,
+      },
+    ]);
+    const statements = Array.from(
+      { length: 20 },
+      (_, index) => `INSERT INTO dbo.Items (body) VALUES (N'č-${index}-${'x'.repeat(20_000)}');`,
+    );
+
+    await restoreSqlDump({ connection: bulk.connection, source: `${statements.join('\n')}\nGO\n` });
+
+    expect(bulk.bulkRequests).toEqual([]);
+    expect(bulk.sqlBatches.length).toBeGreaterThan(1);
+    expect(Math.max(...bulk.sqlBatches.map(sql => sql.length))).toBeLessThanOrEqual(256 * 1024);
+    expect(bulk.sqlBatches.join('\n')).toBe(statements.join('\n'));
+  });
+
   it('does not replay a batch after a bulk operation has started and failed', async () => {
     const bulk = createBulkRestoreConnection(
       [
