@@ -301,6 +301,36 @@ GO
     expect(bulk.sqlBatches).toEqual([batch]);
   });
 
+  it('falls back only the unsupported INSERT while bulk-loading surrounding statements', async () => {
+    const bulk = createBulkRestoreConnection([
+      {
+        columnName: 'body',
+        dataType: 'varchar',
+        maxLength: 100,
+        precision: 0,
+        scale: 0,
+        isNullable: 0,
+        isIdentity: 0,
+      },
+    ]);
+    const unsupported = "INSERT INTO dbo.Items (body) VALUES (N'北京');";
+    const source = [
+      "INSERT INTO dbo.Items (body) VALUES ('before');",
+      unsupported,
+      "INSERT INTO dbo.Items (body) VALUES ('after');",
+      'GO',
+      '',
+    ].join('\n');
+
+    const result = await restoreSqlDump({ connection: bulk.connection, source });
+
+    expect(result.errors).toEqual([]);
+    expect(bulk.sqlBatches).toEqual([unsupported]);
+    expect(bulk.bulkRequests).toHaveLength(2);
+    expect(bulk.bulkRequests[0]!.rows).toEqual([['before']]);
+    expect(bulk.bulkRequests[1]!.rows).toEqual([['after']]);
+  });
+
   it('does not replay a batch after a bulk operation has started and failed', async () => {
     const bulk = createBulkRestoreConnection(
       [
