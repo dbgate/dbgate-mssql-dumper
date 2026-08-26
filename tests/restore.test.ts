@@ -22,11 +22,14 @@ function createBulkRestoreConnection(
   readonly connection: MssqlConnection;
   readonly sqlBatches: string[];
   readonly bulkRequests: MssqlBulkInsertRequest[];
+  readonly bulkFlushes: number[];
   readonly metadataQueries: MssqlQuery[];
 } {
   const sqlBatches: string[] = [];
   const bulkRequests: MssqlBulkInsertRequest[] = [];
+  const bulkFlushes: number[] = [];
   const metadataQueries: MssqlQuery[] = [];
+  let pendingBulkRows = 0;
   const connection: MssqlConnection = {
     bulkInsertCapabilities: {
       supportsNonAsciiVarchar: options?.supportsNonAsciiVarchar,
@@ -47,14 +50,20 @@ function createBulkRestoreConnection(
     async bulkInsert(request: MssqlBulkInsertRequest) {
       bulkRequests.push(request);
       if (options?.failBulk) throw new Error('simulated bulk failure');
+      pendingBulkRows += request.rows.length;
       return { rowsAffected: request.rows.length };
+    },
+    async flushBulkInsert() {
+      if (pendingBulkRows === 0) return;
+      bulkFlushes.push(pendingBulkRows);
+      pendingBulkRows = 0;
     },
     stream() {
       return (async function* () {})();
     },
     async cancel() {},
   };
-  return { connection, sqlBatches, bulkRequests, metadataQueries };
+  return { connection, sqlBatches, bulkRequests, bulkFlushes, metadataQueries };
 }
 
 describe('isDumperSqlDump', () => {
@@ -204,9 +213,42 @@ GO
     expect(bulk.bulkRequests[0]!.rows[0]![1]).toBe("hello 'world\nGO\nok");
     expect(bulk.bulkRequests[0]!.rows[0]![2]).toEqual(Buffer.from([0, 255]));
     expect(bulk.bulkRequests[0]!.rows[0]![3]).toBeInstanceOf(Date);
+    expect(bulk.bulkFlushes).toEqual([2]);
     expect(
       (bulk.bulkRequests[0]!.rows[0]![3] as Date & { nanosecondDelta?: number }).nanosecondDelta,
     ).toBeCloseTo(0.0004567, 7);
+  });
+
+  it('keeps consecutive GO batches for one table in a single bulk session', async () => {
+    const bulk = createBulkRestoreConnection([
+      {
+        columnName: 'id',
+        dataType: 'int',
+        maxLength: 4,
+        precision: 10,
+        scale: 0,
+        isNullable: 0,
+        isIdentity: 1,
+      },
+    ]);
+    const source = `SET IDENTITY_INSERT dbo.Items ON;
+INSERT INTO dbo.Items (id) VALUES (1), (2);
+GO
+INSERT INTO dbo.Items (id) VALUES (3), (4);
+SET IDENTITY_INSERT dbo.Items OFF;
+GO
+`;
+
+    const result = await restoreSqlDump({ connection: bulk.connection, source });
+
+    expect(result.errors).toEqual([]);
+    expect(result.rowsRestored).toBe(4);
+    expect(bulk.bulkRequests).toHaveLength(2);
+    expect(bulk.bulkFlushes).toEqual([4]);
+    expect(bulk.sqlBatches).toEqual([
+      'SET IDENTITY_INSERT dbo.Items ON;',
+      'SET IDENTITY_INSERT dbo.Items OFF;',
+    ]);
   });
 
   it('falls back with the entire batch when an INSERT expression is not canonical', async () => {

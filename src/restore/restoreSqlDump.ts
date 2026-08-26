@@ -79,6 +79,10 @@ async function executeBatchText(
   return { rowsAffected: result.rowsAffected };
 }
 
+async function flushBulkInsert(connection: MssqlConnection, signal?: AbortSignal): Promise<void> {
+  await connection.flushBulkInsert?.(signal);
+}
+
 async function executePreparedInsertBatch(
   connection: MssqlConnection,
   operations: readonly PreparedInsertBatchOperation[],
@@ -89,6 +93,10 @@ async function executePreparedInsertBatch(
   for (const operation of operations) {
     throwIfAborted(signal);
     if (operation.kind === 'sql') {
+      // A stateful native adapter may have accumulated rows from several GO
+      // batches. Materialize them before any later session-scoped SQL (most
+      // importantly SET IDENTITY_INSERT OFF) can run.
+      await flushBulkInsert(connection, signal);
       const result = await executeBatchText(connection, operation.sql, signal);
       rowsAffected += result.rowsAffected;
       // Observe each session-scoped statement immediately: if a later bulk
@@ -181,7 +189,10 @@ export async function restoreSqlDump(
                 sessionState,
                 request.signal,
               )
-            : await executeBatchText(acquired.connection, batch.sql, request.signal);
+            : await (async () => {
+                await flushBulkInsert(acquired.connection, request.signal);
+                return executeBatchText(acquired.connection, batch.sql, request.signal);
+              })();
           if (!preparedInsertBatch) sessionState.observe(batch.sql);
           rowsRestored += result.rowsAffected;
           batchesExecuted++;
@@ -206,6 +217,7 @@ export async function restoreSqlDump(
             message: executionError.message,
           });
           if (stopOnError) {
+            await flushBulkInsert(acquired.connection).catch(() => {});
             await sessionState.restore(acquired.connection);
             return { batchesExecuted, batchesFailed, rowsRestored, errors, cancelled: false };
           }
@@ -213,10 +225,15 @@ export async function restoreSqlDump(
       }
     }
 
+    await flushBulkInsert(acquired.connection, request.signal);
     report('finalizing');
     await sessionState.restore(acquired.connection);
     return { batchesExecuted, batchesFailed, rowsRestored, errors, cancelled: false };
   } catch (error) {
+    // Preserve successfully staged rows when cancellation or an unrelated
+    // later statement stops the restore. A failed native append discards its
+    // own incomplete staging session before propagating here.
+    await flushBulkInsert(acquired.connection).catch(() => {});
     await sessionState.restore(acquired.connection);
     if (isAbortError(error)) {
       return { batchesExecuted, batchesFailed, rowsRestored, errors, cancelled: true };

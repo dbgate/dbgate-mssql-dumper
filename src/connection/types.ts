@@ -164,6 +164,14 @@ export interface MssqlConnection {
     signal?: AbortSignal,
   ): Promise<MssqlBulkInsertResult>;
 
+  /**
+   * Flushes rows buffered by a stateful bulk adapter into their target table.
+   * Restore calls this before ordinary SQL, at the end of the input, and
+   * during cleanup. Adapters whose {@link bulkInsert} commits immediately
+   * omit it.
+   */
+  flushBulkInsert?(signal?: AbortSignal): Promise<void>;
+
   /** Requests cancellation of the currently executing statement, if any. */
   cancel(): Promise<void>;
 }
