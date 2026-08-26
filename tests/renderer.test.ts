@@ -51,6 +51,12 @@ describe('renderPlainSql', () => {
     const createTableIdx = text.indexOf('CREATE TABLE dbo.Orders');
     expect(dropTableIdx).toBeGreaterThanOrEqual(0);
     expect(createTableIdx).toBeGreaterThan(dropTableIdx);
+    expect(text).toContain(
+      "IF OBJECT_ID(N'dbo.Orders', N'U') IS NOT NULL\nBEGIN\n  ALTER TABLE dbo.Orders DROP CONSTRAINT IF EXISTS FK_Orders_Customers;\nEND;",
+    );
+    expect(text).toContain(
+      "IF OBJECT_ID(N'dbo.Orders', N'U') IS NOT NULL\nBEGIN\n  DROP INDEX IF EXISTS IX_Orders_CustomerId ON dbo.Orders;\nEND;",
+    );
   });
 
   it('throws for an invalid (cyclic) archive', async () => {

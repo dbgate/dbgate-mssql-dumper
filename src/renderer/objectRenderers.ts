@@ -28,6 +28,24 @@ function qq(parts: readonly string[], options: ResolvedPlainSqlRenderOptions): s
 }
 
 /**
+ * Guards a parent-table operation whose own `IF EXISTS` clause does not
+ * protect against a missing table. SQL Server resolves the `ALTER TABLE` or
+ * `... ON table` target before checking whether the child object exists.
+ */
+function renderIfTableExists(
+  schemaName: string,
+  pureName: string,
+  sql: string,
+  options: ResolvedPlainSqlRenderOptions,
+): string {
+  const tableObjectName = quoteUnicodeStringLiteral(qq([schemaName, pureName], options));
+  return `IF OBJECT_ID(${tableObjectName}, N'U') IS NOT NULL
+BEGIN
+${options.indentation}${sql}
+END;`;
+}
+
+/**
  * Builds the `SET ANSI_NULLS`/`SET QUOTED_IDENTIFIER` preamble a module
  * (view/procedure/function/trigger) needs recreated ahead of it, from the
  * session settings SQL Server itself recorded when the module was created
@@ -344,7 +362,12 @@ function constraintDisableStatement(
 
 export function renderIndexDrop(index: MssqlIndex, options: ResolvedPlainSqlRenderOptions): string {
   const tableName = qq([index.schemaName, index.pureName], options);
-  return `DROP INDEX IF EXISTS ${qi(index.indexName, options)} ON ${tableName};`;
+  return renderIfTableExists(
+    index.schemaName,
+    index.pureName,
+    `DROP INDEX IF EXISTS ${qi(index.indexName, options)} ON ${tableName};`,
+    options,
+  );
 }
 
 export function renderConstraintDrop(
@@ -354,7 +377,12 @@ export function renderConstraintDrop(
   options: ResolvedPlainSqlRenderOptions,
 ): string {
   const tableName = qq([schemaName, pureName], options);
-  return `ALTER TABLE ${tableName} DROP CONSTRAINT IF EXISTS ${qi(constraintName, options)};`;
+  return renderIfTableExists(
+    schemaName,
+    pureName,
+    `ALTER TABLE ${tableName} DROP CONSTRAINT IF EXISTS ${qi(constraintName, options)};`,
+    options,
+  );
 }
 
 export function renderViewCreate(view: MssqlView, _options: ResolvedPlainSqlRenderOptions): string {
