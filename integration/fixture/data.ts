@@ -9,10 +9,10 @@
  * Everything in the tables compared strictly (`AllTypes`, `Customers`,
  * `Orders`, ...) is chosen to be exactly round-trippable through the Tedious
  * driver, so a comparison failure means a real bug in this package. Values
- * that the driver itself cannot carry losslessly — decimals beyond ~15
- * significant digits, `money` at its range limit, a `datetimeoffset`'s
- * original display offset — live in `dbo.PrecisionLimits`, which the
- * round-trip comparison excludes and a dedicated test asserts on explicitly.
+ * that the driver itself cannot carry losslessly — currently a
+ * `datetimeoffset`'s original display offset — live in `dbo.PrecisionLimits`,
+ * which the round-trip comparison excludes and a dedicated test asserts on
+ * explicitly.
  */
 
 /** Explicit identity values, including a deliberate gap, so identity preservation is verifiable. */
@@ -103,8 +103,9 @@ values
   (2, null, null, null);`,
 
   // ---------------------------------------------------------- PrecisionLimits
-  // Deliberately beyond what the driver can carry losslessly; excluded from
-  // the strict round-trip comparison and asserted on separately.
+  // Exact numerics deliberately exceed IEEE-754 precision; the exporter must
+  // read them as text before they enter the driver. The datetimeoffset display
+  // offset remains a documented driver limitation.
   `insert into [dbo].[PrecisionLimits] ([Id], [HugeDecimal], [MaxMoney], [OffsetPlus], [OffsetMinus])
 values
   (1, 1234567890123456789012345678.1234567890, 92233720368547.5807,

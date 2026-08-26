@@ -11,8 +11,9 @@ driver returns it — so driver lossiness cannot mask a difference.
 | ------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `bit`                          | `0` / `1`                                                     |                                                                                                                                      |
 | `tinyint`, `smallint`, `int`   | plain digits                                                  | Boundary values verified (`0`/`255`, `±32768`, `±2147483647`)                                                                        |
-| `bigint`                       | plain digits                                                  | Tedious returns these as a decimal _string_; passed through verbatim so full 64-bit range is exact, including `±9223372036854775807` |
-| `decimal`, `numeric`           | plain digits, never exponential                               | Exact up to ~15 significant digits — see below                                                                                       |
+| `bigint`                       | plain digits                                                  | Read as server-converted text; full 64-bit range is exact, including `±9223372036854775807`                                          |
+| `decimal`, `numeric`           | plain digits, never exponential                               | Read as server-converted text; all 38 significant digits are preserved                                                               |
+| `money`, `smallmoney`          | plain digits with four fractional digits                      | Read as server-converted text with style 2; full ranges are preserved                                                                |
 | `float`, `real`                | JS shortest round-trip form, **keeping** exponential notation | Required: expanding `1.79e308` to 309 plain digits yields a literal SQL Server parses as `decimal` (max precision 38) and rejects    |
 | `char`, `varchar`, `text`      | `'…'`, `''`-escaped                                           |                                                                                                                                      |
 | `nchar`, `nvarchar`, `ntext`   | `N'…'`, `''`-escaped                                          | Unicode, astral-plane emoji and ZWJ sequences verified                                                                               |
@@ -30,6 +31,15 @@ driver returns it — so driver lossiness cannot mask a difference.
 ISO-8601 with a `T` separator is used throughout because SQL Server parses it
 unambiguously regardless of session `LANGUAGE`/`DATEFORMAT`.
 
+### Exact numerics
+
+`bigint`, `decimal`, `numeric`, `money` and `smallmoney` are converted to
+`varchar(64)` by SQL Server in the export query. For money types, conversion
+style 2 retains all four fractional digits. The JavaScript driver therefore
+receives exact numeric text instead of a float64, and the dump writes that text
+as an unquoted numeric literal. This preserves the full SQL Server ranges,
+including all 38 decimal digits and the `money` range extremes.
+
 ## Round-trips with a documented caveat
 
 ### `datetimeoffset`
@@ -46,35 +56,6 @@ claim about the source row's offset — and every such column produces a
 A source value of `2023-06-15T12:00:00+05:45` restores as
 `2023-06-15T06:15:00+00:00`: same point in time, different stored offset. Both
 directions of this are pinned by tests so it cannot regress silently.
-
-### `decimal` / `numeric` beyond ~15 significant digits
-
-Tedious's `readNumeric()` divides by `10^scale` in floating point, always
-producing a JS `number` (IEEE 754 double). Precision the driver has already
-discarded cannot be recovered here.
-
-This package introduces **no additional** loss: it never re-rounds and never
-emits exponential notation for an exact-numeric target. If a value ever arrives
-as a driver-supplied numeric _string_ it is passed through verbatim and
-unquoted, which is lossless. Columns with precision > 15 get a
-`possible-precision-loss` warning.
-
-Concretely: `decimal(38,10)` holding
-`1234567890123456789012345678.1234567890` restores with roughly the leading 17
-digits intact and the remainder zeroed.
-
-### `money`
-
-Same float64 path (an integer divided by 10000), and with a harsher failure mode
-at the extreme: `money`'s maximum `922337203685477.5807` rounds **up** to
-`922337203685477.6` as a double, which is outside the type's range — so the
-generated `INSERT` fails with an arithmetic overflow rather than storing an
-approximation. Every `money` column therefore gets a `possible-precision-loss`
-warning. Values within ~15 significant digits round-trip exactly.
-
-`smallmoney` is **exact** and carries no warning: its whole range
-(±214748.3647) is 10 significant digits, comfortably inside what a double
-represents exactly.
 
 ## Collation
 

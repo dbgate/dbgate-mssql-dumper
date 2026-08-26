@@ -273,9 +273,9 @@ describeIntegration('round-trip: source -> dump -> empty target -> restore -> ve
 
   // --------------------------------------------- documented driver limits
 
-  it('reports the known precision/offset limitations as structured warnings', () => {
+  it('reports the remaining datetimeoffset limitation without numeric precision warnings', () => {
     const codes = new Set(dumpResult.warnings.map(w => w.code));
-    expect(codes).toContain('possible-precision-loss');
+    expect(codes).not.toContain('possible-precision-loss');
     expect(codes).toContain('datetimeoffset-normalized-to-utc');
     expect(dumpResult.warnings.every(w => w.severity !== 'error')).toBe(true);
   });
@@ -303,20 +303,24 @@ describeIntegration('round-trip: source -> dump -> empty target -> restore -> ve
     expect(rawOffset).toContain('+00:00');
   });
 
-  it('loses precision only beyond ~15 significant digits, as documented', async () => {
-    const read = (connectionName: 'source' | 'target'): Promise<string | null> =>
+  it('preserves high-precision decimal and money values exactly', async () => {
+    const read = (
+      connectionName: 'source' | 'target',
+      columnName: 'HugeDecimal' | 'MaxMoney',
+    ): Promise<string | null> =>
       readScalarText(
         fixtures[connectionName].connection,
-        'select convert(nvarchar(64), [HugeDecimal]) as value from [dbo].[PrecisionLimits] where [Id] = 1',
+        `select convert(nvarchar(64), [${columnName}], 2) as value from [dbo].[PrecisionLimits] where [Id] = 1`,
       );
 
-    const sourceValue = await read('source');
-    const targetValue = await read('target');
+    const sourceDecimal = await read('source', 'HugeDecimal');
+    const targetDecimal = await read('target', 'HugeDecimal');
+    const sourceMoney = await read('source', 'MaxMoney');
+    const targetMoney = await read('target', 'MaxMoney');
 
-    expect(sourceValue).toBe('1234567890123456789012345678.1234567890');
-    // The driver already read this back as a float64, so the exported literal
-    // could not carry the full 38 digits. The leading ~15 digits still match.
-    expect(targetValue).not.toBe(sourceValue);
-    expect(targetValue?.slice(0, 15)).toBe(sourceValue?.slice(0, 15));
+    expect(sourceDecimal).toBe('1234567890123456789012345678.1234567890');
+    expect(targetDecimal).toBe(sourceDecimal);
+    expect(sourceMoney).toBe('92233720368547.5807');
+    expect(targetMoney).toBe(sourceMoney);
   });
 });

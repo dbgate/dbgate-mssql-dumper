@@ -107,6 +107,6 @@ export interface TableDataExportResult {
   readonly rowsExported: number;
   readonly bytesWritten: number;
   readonly cancelled: boolean;
-  /** Structured, one-per-column notices for excluded/precision-limited columns (see `columnValueRenderer.ts`). */
+  /** Structured, one-per-column notices for excluded or fidelity-limited columns (see `columnValueRenderer.ts`). */
   readonly warnings: readonly MssqlDiagnostic[];
 }

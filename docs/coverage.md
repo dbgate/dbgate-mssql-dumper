@@ -50,8 +50,8 @@ Legend: ✅ full · ⚠️ partial · ❌ not implemented · — not applicable
 | ------------------------------------------------------------ | ------- | ------- | ----------------- | ------------------------------------------------------------------------- |
 | `bit`, `tinyint`, `smallint`, `int`                          | ✅      | ✅      | unit + round-trip | Boundary values verified                                                  |
 | `bigint`                                                     | ✅      | ✅      | unit + round-trip | Exact across the full 64-bit range                                        |
-| `decimal`, `numeric`                                         | ✅      | ⚠️      | unit + round-trip | Exact to ~15 significant digits; `possible-precision-loss` warning beyond |
-| `money`, `smallmoney`                                        | ✅      | ⚠️      | unit + round-trip | Same; at the range extreme the `INSERT` overflows                         |
+| `decimal`, `numeric`                                         | ✅      | ✅      | unit + round-trip | Exact across all 38 significant digits                                    |
+| `money`, `smallmoney`                                        | ✅      | ✅      | unit + round-trip | Exact across the full ranges                                              |
 | `float`, `real`                                              | ✅      | ✅      | unit + round-trip | Exponential notation retained (required at the double extremes)           |
 | `char`, `varchar`, `text`                                    | ✅      | ✅      | unit + round-trip | —                                                                         |
 | `nchar`, `nvarchar`, `ntext`                                 | ✅      | ✅      | unit + round-trip | `N'…'`; emoji/ZWJ verified                                                |

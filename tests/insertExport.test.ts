@@ -90,8 +90,8 @@ function createFakeDataConnection(
       }
       throw new Error(`Unexpected query: ${query.sql}`);
     },
-    stream<Row extends MssqlRow = MssqlRow>(): AsyncIterable<Row> {
-      queries.push('(stream)');
+    stream<Row extends MssqlRow = MssqlRow>(query: MssqlQuery): AsyncIterable<Row> {
+      queries.push(query.sql);
       return (async function* () {
         for (const row of rows) {
           yield row as unknown as Row;
@@ -170,6 +170,57 @@ describe('exportTableDataAsInserts: column-aware path', () => {
     // All three rows collapse into a single multi-row INSERT statement (one "INSERT INTO" line).
     expect(insertStatements).toHaveLength(1);
     expect(writer.toString()).toContain("(1, N'Alice'),\n(2, N'Bob'),\n(3, N'Cara');");
+  });
+
+  it('reads exact numeric types as text before values enter the JavaScript driver', async () => {
+    const exactNumericTable = table({
+      pureName: 'ExactNumbers',
+      columns: [
+        column({ columnName: 'Id', dataType: 'bigint', ordinalPosition: 1 }),
+        column({
+          columnName: 'Amount',
+          dataType: 'decimal',
+          ordinalPosition: 2,
+          precision: 38,
+          scale: 10,
+        }),
+        column({
+          columnName: 'Price',
+          dataType: 'numeric',
+          ordinalPosition: 3,
+          precision: 18,
+          scale: 2,
+        }),
+        column({ columnName: 'Balance', dataType: 'money', ordinalPosition: 4 }),
+      ],
+    });
+    const connection = createFakeDataConnection([
+      {
+        Id: '9223372036854775807',
+        Amount: '1234567890123456789012345678.1234567890',
+        Price: '1234567890123456.78',
+        Balance: '92233720368547.5807',
+      },
+    ]);
+    const writer = new StringDumpWriter();
+
+    const result = await exportTableDataAsInserts({
+      connection,
+      schemaName: 'dbo',
+      pureName: 'ExactNumbers',
+      writer,
+      table: exactNumericTable,
+    });
+
+    expect(connection.queries).toContain(
+      'SELECT CONVERT(varchar(64), Id) AS Id, CONVERT(varchar(64), Amount) AS Amount, CONVERT(varchar(64), Price) AS Price, CONVERT(varchar(64), Balance, 2) AS Balance FROM dbo.ExactNumbers',
+    );
+    expect(writer.toString()).toContain(
+      '(9223372036854775807, 1234567890123456789012345678.1234567890, 1234567890123456.78, 92233720368547.5807);',
+    );
+    expect(result.warnings.some(warning => warning.code === 'possible-precision-loss')).toBe(
+      false,
+    );
   });
 
   it('flushes a new statement once maxRowsPerStatement is reached', async () => {

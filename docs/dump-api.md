@@ -146,7 +146,6 @@ log text. Codes you may see:
 
 | Code                                                                      | Meaning                                                                                                             |
 | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `possible-precision-loss`                                                 | `decimal`/`numeric` above ~15 significant digits, or any `money`/`smallmoney` — the driver reads these as a float64 |
 | `datetimeoffset-normalized-to-utc`                                        | The original display offset is not recoverable through Tedious; the instant is preserved                            |
 | `unsupported-column-type`                                                 | `sql_variant`/`xml`/`geography`/`geometry`/`hierarchyid` excluded from `INSERT` output                              |
 | `data-not-rendered`                                                       | A selected `sequenceState` entry (sequence current value is not exported)                                           |

@@ -76,13 +76,13 @@ describe('columnExportDiagnostics', () => {
     expect(diagnostics[0]).toMatchObject({ severity: 'warning', code: 'unsupported-column-type' });
   });
 
-  it('warns about possible precision loss for high-precision decimal columns', () => {
+  it('does not warn for high-precision decimals because export reads them as exact text', () => {
     const diagnostics = columnExportDiagnostics(
       column({ columnName: 'Amount', dataType: 'decimal', precision: 38, scale: 10 }),
       'dbo',
       'T',
     );
-    expect(diagnostics.some(d => d.code === 'possible-precision-loss')).toBe(true);
+    expect(diagnostics.some(d => d.code === 'possible-precision-loss')).toBe(false);
   });
 
   it('does not warn about precision for a decimal column within safe JS-number range', () => {
@@ -195,17 +195,12 @@ describe('renderColumnValue', () => {
     }
   });
 
-  it('emits no precision warning for smallmoney, whose range fits a double exactly', () => {
-    // ±214748.3647 is 10 significant digits, so the int32/10000 division the
-    // driver performs is always exact — warning here was a false positive.
-    expect(
-      columnExportDiagnostics(column({ columnName: 'M', dataType: 'smallmoney' }), 'dbo', 'T'),
-    ).toEqual([]);
-    expect(
-      columnExportDiagnostics(column({ columnName: 'M', dataType: 'money' }), 'dbo', 'T').map(
-        d => d.code,
-      ),
-    ).toContain('possible-precision-loss');
+  it('emits no precision warning for money types because export reads them as exact text', () => {
+    for (const dataType of ['money', 'smallmoney']) {
+      expect(
+        columnExportDiagnostics(column({ columnName: 'M', dataType }), 'dbo', 'T'),
+      ).toEqual([]);
+    }
   });
 
   it('never emits more fractional digits than the column scale permits', () => {

@@ -706,8 +706,12 @@ distinctions `renderSqlLiteral` structurally cannot:
 - `char`/`varchar`/`text` use plain `'...'` quoting; `nchar`/`nvarchar`/
   `ntext` use `N'...'` — both correctly handle embedded `'`, embedded CR/LF,
   and Unicode content; only the unicode-prefix choice differs.
-- Exact numeric types (`decimal`/`numeric`/`money`/`smallmoney`, and the
-  integer family) and approximate numeric types (`float`/`real`) all render
+- Exact numeric types that can exceed IEEE-754 precision (`bigint`, `decimal`,
+  `numeric`, `money` and `smallmoney`) are selected through a server-side
+  `CONVERT(varchar(64), …)`
+  before a JavaScript driver can narrow them to an IEEE-754 number. The exact
+  numeric text is emitted verbatim and unquoted. Approximate numeric types
+  (`float`/`real`) render
   through `formatFiniteNumber()`, which expands JS's exponential notation
   (used for magnitudes `>= 1e21` or `< 1e-6`) into a plain digit string —
   T-SQL's exact-numeric literal grammar does not accept exponential
@@ -731,19 +735,12 @@ distinctions `renderSqlLiteral` structurally cannot:
   classification gap degrades gracefully instead of aborting an export
   partway through a table.
 
-### Known driver limitations, reported rather than hidden
+### Known driver limitation, reported rather than hidden
 
-Two SQL Server type behaviors cannot be fully recovered through the
-Tedious adapter, and `columnExportDiagnostics()` reports both explicitly
-instead of exporting a value that looks correct but is not:
+One SQL Server type behavior cannot be fully recovered through the Tedious
+adapter, and `columnExportDiagnostics()` reports it explicitly instead of
+exporting a value that looks correct but is not:
 
-- **`decimal`/`numeric` above ~15 significant digits.** Tedious's value
-  parser divides by `10^scale` in floating point (`readNumeric()` in
-  `tedious/lib/value-parser.js`), always producing a JS `number` (an IEEE
-  754 double). This package's own rendering introduces no _additional_
-  rounding beyond what the driver already applied, but it cannot recover
-  precision the driver has already lost. A `possible-precision-loss`
-  warning is emitted once per affected column.
 - **`datetimeoffset` always loses its original UTC offset.** Tedious's
   `readDateTimeOffset()` reads the offset bytes off the wire but discards
   the parsed value, constructing the returned `Date` via `Date.UTC(...)`

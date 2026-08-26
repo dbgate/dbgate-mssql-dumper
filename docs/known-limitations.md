@@ -13,13 +13,6 @@ test so it cannot regress unnoticed.
 - **`datetimeoffset` loses its display offset.** `readDateTimeOffset()` reads the
   offset bytes and discards them. The instant is exact; the stored offset becomes
   `+00:00`. Warning: `datetimeoffset-normalized-to-utc`.
-- **`decimal`/`numeric` beyond ~15 significant digits lose precision.**
-  `readNumeric()` divides by `10^scale` in floating point. This package adds no
-  further loss. Warning: `possible-precision-loss`.
-- **`money` at the range extreme fails to restore.** The maximum
-  `922337203685477.5807` rounds _up_ as a double to a value outside the type's
-  range, so the `INSERT` overflows rather than storing an approximation. Warning:
-  `possible-precision-loss`. (`smallmoney` is exact and carries no warning.)
 
 ## Column data not exported
 

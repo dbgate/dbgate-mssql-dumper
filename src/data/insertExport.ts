@@ -30,6 +30,30 @@ const MAX_ROWS_PER_STATEMENT_CEILING = 1000;
  */
 const DEFAULT_MAX_ROWS_PER_STATEMENT = 100;
 
+const EXACT_NUMERIC_TEXT_TYPES = new Set([
+  'bigint',
+  'decimal',
+  'numeric',
+  'money',
+  'smallmoney',
+]);
+
+/**
+ * Makes SQL Server serialize exact numerics before a JavaScript driver can
+ * narrow them to an IEEE-754 number. The original column name is retained so
+ * the row renderer can keep using the introspected column metadata.
+ */
+function renderDataSelectExpression(column: MssqlColumn): string {
+  const identifier = quoteIdentifier(column.columnName);
+  const type = column.dataType.toLowerCase();
+  if (!EXACT_NUMERIC_TEXT_TYPES.has(type)) return identifier;
+
+  // Style 2 is required for money/smallmoney to retain all four fractional
+  // digits. Decimal/numeric/bigint are rendered exactly by the default style.
+  const style = type === 'money' || type === 'smallmoney' ? ', 2' : '';
+  return `CONVERT(varchar(64), ${identifier}${style}) AS ${identifier}`;
+}
+
 function isAbortError(error: unknown): boolean {
   return (
     (error instanceof DOMException && error.name === 'AbortError') ||
@@ -208,6 +232,7 @@ export async function exportTableDataAsInserts(
       const columnList = insertableColumns
         .map(column => quoteIdentifier(column.columnName))
         .join(', ');
+      const selectList = insertableColumns.map(renderDataSelectExpression).join(', ');
       const statementHeader = `INSERT INTO ${tableIdent} (${columnList}) VALUES\n`;
       const statementHeaderBytes = Buffer.byteLength(statementHeader, 'utf8');
       let statementTuples: string[] = [];
@@ -228,7 +253,7 @@ export async function exportTableDataAsInserts(
       };
 
       for await (const row of connection.stream(
-        { sql: `SELECT ${columnList} FROM ${tableIdent}${orderByClause}` },
+        { sql: `SELECT ${selectList} FROM ${tableIdent}${orderByClause}` },
         { signal, batchSize: streamBatchSize },
       )) {
         throwIfAborted(signal);

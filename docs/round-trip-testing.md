@@ -69,8 +69,9 @@ source database
 ### Values are compared as SQL Server renders them, not as the driver returns them
 
 This is the crux. Comparing driver-returned JS values would hide exactly the bugs
-worth catching: two _different_ stored `decimal`s can arrive as the same float64,
-and a `datetimeoffset`'s offset is gone before JS sees it. So each column is read
+worth catching: two _different_ stored `decimal`s can arrive as the same float64
+if they are not converted to text first, and a `datetimeoffset`'s offset is gone
+before JS sees it. So each column is read
 through a server-side conversion to text —
 `convert(varchar, col, 121)` for date/time, style `3` for float, style `1` for
 binary, `at time zone 'UTC'` for `datetimeoffset` — and the resulting strings are
@@ -121,10 +122,9 @@ The fixture is created by a deliberately dumb statement-list executor, **never**
 by this package's own batch parser — otherwise a splitting bug could corrupt the
 fixture and mask itself.
 
-Values the driver cannot carry losslessly live in a separate
-`dbo.PrecisionLimits` table, excluded from strict comparison and asserted on
-explicitly instead, so the documented limitations are pinned in both directions
-rather than tolerated.
+Driver edge cases live in a separate `dbo.PrecisionLimits` table and are asserted
+on explicitly. It verifies that exact numerics bypass the driver's float64 path
+and that the remaining `datetimeoffset` limitation is pinned in both directions.
 
 ### Notable behavioural assertions
 

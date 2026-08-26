@@ -110,36 +110,6 @@ export function columnExportDiagnostics(
     return diagnostics;
   }
 
-  if ((type === 'decimal' || type === 'numeric') && (column.precision ?? 0) > 15) {
-    diagnostics.push({
-      severity: 'warning',
-      code: 'possible-precision-loss',
-      message: `Column "${schemaName}"."${pureName}"."${column.columnName}" is ${type}(${column.precision},${column.scale ?? 0}); a driver that reads it back as a JS number (an IEEE 754 double, ~15-17 significant digits) cannot represent every value at this precision exactly`,
-      objectReference,
-    });
-  }
-
-  // `smallmoney` is deliberately excluded: its full range (±214748.3647) is 10
-  // significant digits, so the int32/10000 division Tedious performs is always
-  // exactly representable as a double and the value round-trips bit-exactly.
-  // Warning about it would be a guaranteed false positive.
-  if (type === 'money') {
-    // `money` carries 19 digits of precision and `smallmoney` 10, both at a
-    // fixed scale of 4, and Tedious reads them by dividing an integer by
-    // 10000 in floating point — so a `money` value always risks rounding.
-    // Worth its own notice because the failure mode is harsher than for
-    // `decimal`: `money`'s maximum, 922337203685477.5807, rounds *up* to
-    // 922337203685477.6 as a double, which is outside the type's range, so
-    // the generated INSERT fails with an overflow instead of storing an
-    // approximation.
-    diagnostics.push({
-      severity: 'warning',
-      code: 'possible-precision-loss',
-      message: `Column "${schemaName}"."${pureName}"."${column.columnName}" is money; the Tedious value parser reads it as a JS number (an IEEE 754 double) by dividing by 10000, so values needing more than ~15 significant digits are rounded — and a value at the very edge of money's range may round outside it and fail to restore`,
-      objectReference,
-    });
-  }
-
   if (type === 'datetimeoffset') {
     diagnostics.push({
       severity: 'warning',
