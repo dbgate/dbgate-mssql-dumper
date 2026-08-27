@@ -140,6 +140,7 @@ export async function restoreSqlDump(
     batch?: ParsedSqlBatch,
     descriptor?: RestoreExecutionDescriptor,
     executionState?: 'started' | 'finished' | 'failed',
+    error?: RestoreBatchError,
   ): void => {
     request.progress?.({
       phase,
@@ -148,6 +149,7 @@ export async function restoreSqlDump(
       rowsRestored,
       ...descriptor,
       executionState,
+      error,
     });
   };
 
@@ -202,7 +204,6 @@ export async function restoreSqlDump(
             throw error;
           }
           batchesFailed++;
-          report('executing', batch, executionDescriptor, 'failed');
           const executionError = new RestoreExecutionError(
             batch.batchIndex,
             batch.location,
@@ -210,12 +211,14 @@ export async function restoreSqlDump(
             redactSecrets(error instanceof Error ? error.message : String(error)),
             { cause: error },
           );
-          errors.push({
+          const restoreError = {
             batchIndex: executionError.batchIndex,
             location: executionError.location,
             sqlPreview: executionError.sqlPreview,
             message: executionError.message,
-          });
+          };
+          errors.push(restoreError);
+          report('executing', batch, executionDescriptor, 'failed', restoreError);
           if (stopOnError) {
             await flushBulkInsert(acquired.connection).catch(() => {});
             await sessionState.restore(acquired.connection);

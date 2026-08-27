@@ -639,6 +639,40 @@ GO
     expect(result.errors).toHaveLength(1);
   });
 
+  it('collects every failing batch when stopOnError is false', async () => {
+    const executed: string[] = [];
+    const reportedErrors: Array<{ batchIndex: number; message: string }> = [];
+    const connection = createFakeConnection({
+      onExecute: sql => executed.push(sql),
+      failOn: sql => sql.startsWith('THROW '),
+    });
+
+    const result = await restoreSqlDump({
+      connection,
+      source:
+        "THROW 51000, 'test error 1', 1;\nGO\nSELECT 1;\nGO\nTHROW 51001, 'test error 2', 1;\nGO\nSELECT 2;\nGO\nTHROW 51002, 'test error 3', 1;\nGO\n",
+      options: { stopOnError: false },
+      progress: event => {
+        if (event.error) {
+          reportedErrors.push({ batchIndex: event.error.batchIndex, message: event.error.message });
+        }
+      },
+    });
+
+    expect(executed).toHaveLength(5);
+    expect(result.batchesExecuted).toBe(2);
+    expect(result.batchesFailed).toBe(3);
+    expect(result.errors.map(error => error.batchIndex)).toEqual([0, 2, 4]);
+    expect(result.errors.map(error => error.message)).toEqual([
+      expect.stringContaining('test error 1'),
+      expect.stringContaining('test error 2'),
+      expect.stringContaining('test error 3'),
+    ]);
+    expect(reportedErrors).toEqual(
+      result.errors.map(error => ({ batchIndex: error.batchIndex, message: error.message })),
+    );
+  });
+
   it('reports parsing/executing/finalizing progress with batchIndex and a running rowsRestored total', async () => {
     const connection = createFakeConnection({ rowsAffectedFor: () => 1 });
     const phases: Array<{ phase: string; batchIndex?: number; rowsRestored?: number }> = [];

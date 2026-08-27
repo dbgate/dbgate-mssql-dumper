@@ -42,6 +42,13 @@ export interface RestoreProgressEvent {
   readonly executionReason?: string;
   /** Lifecycle of the current execution attempt. */
   readonly executionState?: 'started' | 'finished' | 'failed';
+  /** Details of the batch failure, emitted immediately with `executionState: 'failed'`. */
+  readonly error?: {
+    readonly batchIndex: number;
+    readonly location: { readonly startLine: number; readonly endLine: number };
+    readonly sqlPreview: string;
+    readonly message: string;
+  };
   readonly schemaName?: string;
   readonly tableName?: string;
 }
